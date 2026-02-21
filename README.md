@@ -164,6 +164,7 @@ Uses `sidgrip/osxcross-base:latest` Docker image with osxcross cross-compiler.
 
 ```
 outputs/
+├── photon.conf         Auto-generated config with RPC credentials and peers
 ├── native/
 │   ├── daemon/         photond
 │   └── qt/             photon-qt
@@ -177,7 +178,7 @@ outputs/
     └── qt/             Photon-Qt.app
 ```
 
-Each output directory includes a `build-info.txt` with OS version and build details.
+The config file is auto-generated on first build with random RPC credentials, active peers from the network, and default settings. Copy it to `~/.photon/photon.conf` before running the daemon.
 
 ## Docker Images
 
