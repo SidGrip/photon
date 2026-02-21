@@ -1,67 +1,208 @@
-Forked from Bitcoin reference wallet 0.8.5 and Blake Coin
+<p align="center">
+  <img src="src/qt/res/icons/bitcoin.png" alt="Photon" width="95">
+</p>
 
-Photon is a cryptocurrency designed to use the Blake 256 algorithm cloned from Blake Coin.
+## About Photon
 
-Blake-256(optimized) faster than scrypt and faster than sha256 in C (asm is still faster for sha256d)
+Photon is the first Blake-256 merge-mined coin. As Photons are plentiful in the universe, the max supply is set to 90 billion.
 
-The algorithm was written as a candidate for sha3, Based on round one candidate code from the sphlib 2.1 and reduced the compression function to 8.
+- Cloned from Blakecoin, forked from **Bitcoin 0.8.5**
+- Uses the **Blake-256** hashing algorithm — a SHA-3 candidate faster than Scrypt, SHA-256D, Keccak, and Groestl
+- Optimized 8-round Blake-256 with reduced double-hashing for efficiency
+- Maintains proven ECDSA security
+- Website: https://blakecoin.org
 
-Tweaks Removed some of the double hashing from the wallet as it is wasteful on compute, No changes to the ecdsa public/private function as that has proven to be secure so far on bitcoin.
+| Network Info | |
+|---|---|
+| Algorithm | Blake-256 (8 rounds) |
+| Block time | 3 minutes |
+| Block reward | 32,768 + sqrt(height) * difficulty |
+| Difficulty retarget | Every 20 blocks (max 15% until block 3500, then 3%) |
+| Default port | 35556 |
+| RPC port | 8984 |
+| Max supply | 90,000,000,000 PHO |
+
+---
+
+## Quick Start (Ubuntu 18.04)
+
+```bash
+git clone https://github.com/SidGrip/photon.git
+cd photon
+sudo apt install build-essential libssl-dev libboost-all-dev \
+  libdb4.8-dev libdb4.8++-dev libminiupnpc-dev \
+  qt5-qmake qtbase5-dev qttools5-dev-tools
+./build.sh --native --both
+```
+
+- Builds both the daemon (`photond`) and Qt wallet (`photon-qt`) natively on Ubuntu 18.04
+- Binaries go to `outputs/native/`
+- On Linux, Qt builds automatically install a `.desktop` launcher and icon so the wallet appears in Activities search
+- For other Ubuntu versions, use Docker or AppImage
+- See below for macOS, Windows, and other build options
+
+## Build Options
+
+```
+./build.sh [PLATFORM] [TARGET] [OPTIONS]
+
+Platforms:
+  --native          Build on this machine (Linux/Ubuntu 18.04, macOS, or Windows)
+  --appimage        Portable Linux AppImage (requires Docker)
+  --windows         Cross-compile for Windows from Linux (requires Docker)
+  --macos           Cross-compile for macOS from Linux (requires Docker)
+
+Targets:
+  --daemon          Daemon only (photond)
+  --qt              Qt wallet only (photon-qt)
+  --both            Both (default)
+
+Docker options (for --appimage, --windows, --macos, or --native on Linux):
+  --pull-docker     Pull prebuilt Docker images from Docker Hub
+  --build-docker    Build Docker images locally from repo Dockerfiles
+
+Other options:
+  --jobs N          Parallel make jobs (default: CPU cores - 1)
+```
+
+## Platform Build Instructions
+
+### Linux (Docker)
+
+Use `--pull-docker` to pull prebuilt images from Docker Hub, or `--build-docker` to build them locally from the Dockerfiles in `docker/`.
+
+```bash
+./build.sh --native --both --pull-docker      # Daemon + Qt (pull from Hub)
+./build.sh --native --qt --pull-docker        # Qt wallet only
+./build.sh --native --daemon --pull-docker    # Daemon only
+./build.sh --native --both --build-docker     # Build Docker image locally first
+./build.sh --appimage --pull-docker           # Portable AppImage
+./build.sh --appimage --build-docker          # AppImage (build image locally)
+```
 
 
-What is Blakecoin?
+### Windows
 
-Blakecoin is an experimental new digital currency that enables instant payments to
-anyone, anywhere in the world. Blakecoin uses peer-to-peer technology to operate
-with no central authority: managing transactions and issuing of coins are carried
-out collectively by the network.
+There are two ways to build for Windows:
 
-What is Photon ?
+**Native (MSYS2/MinGW64)** — builds on Windows directly. Produces a ~10MB exe with DLLs bundled alongside it in the output folder.
 
-A clone of Blakecoin with a few changes.
-The standard block award of Photon is 32,768 BUT as the block chain grows the award will increase.
-The amount it increases is directly related to the current difficulty and height of the blockchain.
-Miners will get 32,768 coins plus the square root of blockchain height multiplied by the current difficulty.
-Still as Photon's are plentiful in the universe the max money is set to 90,000,000,000
-That is 90 Billion Photons. Difficulty retargets every 20 blocks with a target of a new block to be produced every 3 minutes.
-Up to block 3500 the max adjustment is 15% up each retarget.
-After block 3500 the max adjustment is 3% up each retarget.  
+Install [MSYS2](https://www.msys2.org), then from the MINGW64 shell:
 
-Ubuntu 16.04-20.04 dependancies that are used on the Linux build machine:
+```bash
+pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-boost \
+  mingw-w64-x86_64-openssl mingw-w64-x86_64-qt5-base \
+  mingw-w64-x86_64-qt5-tools mingw-w64-x86_64-miniupnpc \
+  mingw-w64-x86_64-db
+```
 
-software-properties-common wget git curl build-essential libssl-dev libboost-all-dev libminiupnpc-dev libdb4.8-dev libdb4.8++-dev
+Then build:
 
-Ubuntu 16.04 alt boost changes in bitcoinrpc.cpp uncomment/comment
+```bash
+./build.sh --native --both          # Daemon + Qt wallet
+./build.sh --native --qt            # Qt wallet only
+./build.sh --native --daemon        # Daemon only
+```
 
-Ubuntu 20.04 add the bitcoin ppa for bionic tested working fine
+**Docker cross-compile (from Linux)** — builds a single ~30MB static exe with no DLL dependencies.
 
-License
+```bash
+./build.sh --windows --both --pull-docker     # Daemon + Qt (pull from Hub)
+./build.sh --windows --qt --pull-docker       # Qt wallet only
+./build.sh --windows --daemon --pull-docker   # Daemon only
+./build.sh --windows --both --build-docker     # Build MXE image locally first
+./build.sh --windows --qt --build-docker      # Qt only (build image locally)
+./build.sh --windows --daemon --build-docker  # Daemon only (build image locally)
+```
 
-Photon is released under the terms of the MIT license. See `COPYING` for more
-information or see http://opensource.org/licenses/MIT.
+Uses `sidgrip/mxe-base:latest` Docker image with MXE cross-compiler. Everything (Qt, Boost, OpenSSL, etc.) is statically linked into one self-contained exe.
 
+> **Why the difference?**
+>
+> - MXE compiles all dependencies from source with the same toolchain, so everything links statically into one binary
+> - MSYS2's static Qt5 package uses a different C runtime (UCRT) than the MinGW64 toolchain (MSVCRT), making fully static linking impossible
+> - The native build auto-bundles all required DLLs in the output folder instead
 
-Blakecoin is released under the terms of the MIT license. See `COPYING` for more
-information or see http://opensource.org/licenses/MIT.
+### macOS
 
+There are two ways to build for macOS:
 
+**Native (Homebrew)** — builds directly on a Mac.
 
-For the most up to date information on Photon and Blake Coin please visit the Blake Coin Homepage https://blakecoin.org/ as it has much more information and detail about Blake Coin, Photon, and other developments with this project.  As always with any open source project please feel free to use github to offer your contributions or ideas to improve the project. 
+Install dependencies:
 
-If you want to support the project but are unable to code consider running a node for Photon 
+```bash
+brew install openssl boost@1.85 miniupnpc berkeley-db@4 qt@5
+```
 
-(If you need help doing this contact @cinnamon_carter )
+Then build:
 
-Some current items I am working on but are not finished with (just a few)
+```bash
+./build.sh --native --both          # Daemon + Qt wallet
+./build.sh --native --qt            # Qt wallet only
+./build.sh --native --daemon        # Daemon only
+```
 
-p2pool support for the blake256 algorithm Blake Coin and the merged child coins
+**Docker cross-compile (from Linux)** — builds a macOS binary from a Linux host.
 
-A power pool merged mining setup to merge mine all the recognized members of the blake256 family
+```bash
+./build.sh --macos --both --pull-docker     # Daemon + Qt (pull from Hub)
+./build.sh --macos --qt --pull-docker       # Qt wallet only
+./build.sh --macos --daemon --pull-docker   # Daemon only
+./build.sh --macos --both --build-docker    # Build osxcross image locally first
+./build.sh --macos --qt --build-docker     # Qt only (build image locally)
+./build.sh --macos --daemon --build-docker # Daemon only (build image locally)
+```
 
-A graphic user interface in open source code (apart from the qt client) for 'decoding' information in the blockchain.
+Uses `sidgrip/osxcross-base:latest` Docker image with osxcross cross-compiler.
 
-A graphic user interface in open source code to allow easier writing of documents or other information and include it in a block as a spent transaction to multiple base 58 addresses  (the manual method is cumbersome)
+---
 
-I am still researching optimizations for blake256 gpu/cpu/fpga mining. 
+## Output Structure
 
-If you can give as a gift a working fpga board to the photon project please get in touch.
+```
+outputs/
+├── native/
+│   ├── daemon/         photond
+│   └── qt/             photon-qt
+├── linux-appimage/
+│   └── qt/             Photon-x86_64.AppImage
+├── windows/
+│   ├── daemon/
+│   └── qt/             photon-qt.exe
+└── macos/
+    ├── daemon/         photond
+    └── qt/             Photon-Qt.app
+```
+
+Each output directory includes a `build-info.txt` with OS version and build details.
+
+## Docker Images
+
+Use `--pull-docker` to pull prebuilt images from Docker Hub, or `--build-docker` to build locally from the Dockerfiles in `docker/`.
+
+| Image | Platform | Hub Size | Local Build Time |
+|-------|----------|----------|-----------------|
+| `sidgrip/daemon-base:18.04` | Linux native builds (daemon + Qt) | ~450 MB | ~10 min |
+| `sidgrip/appimage-base:22.04` | Linux AppImage | ~515 MB | ~15 min |
+| `sidgrip/mxe-base:latest` | Windows cross-compile | ~4.2 GB | ~2-4 hours |
+| `sidgrip/osxcross-base:latest` | macOS cross-compile | ~7.2 GB | ~1-2 hours |
+
+Local builds are cached by Docker — subsequent builds are instant.
+
+> **macOS `--build-docker` note:**
+>
+> - The macOS cross-compile Dockerfile requires an Apple SDK tarball that **cannot be redistributed**
+> - Place `MacOSX26.2.sdk.tar.xz` in `docker/sdk/` before running `--build-docker`
+> - Extract it from [Xcode](https://developer.apple.com/download/all/): `/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/`
+> - Using `--pull-docker` does **not** require the SDK — it is already included in the prebuilt Docker Hub image
+
+---
+
+## Multi-Coin Builder
+
+For building wallets for all Blake-family coins [Blakecoin](https://github.com/BlueDragon747/Blakecoin), [Photon](https://github.com/BlueDragon747/photon), [BlakeBitcoin](https://github.com/BlakeBitcoin/BlakeBitcoin), [Electron](https://github.com/BlueDragon747/Electron-ELT), [Universal Molecule](https://github.com/BlueDragon747/universalmol), [Lithium](https://github.com/BlueDragon747/lithium), see the [Blakestream Installer](https://github.com/SidGrip/Blakestream-Installer).
+
+## License
+
+Photon is released under the terms of the MIT license. See `COPYING` for more information.

@@ -67,9 +67,9 @@ int BitcoinUnits::amountDigits(int unit)
 {
     switch(unit)
     {
-    case PHO: return 8; // 21,000,000 (# digits, without commas)
-    case mPHO: return 11; // 21,000,000,000
-    case uPHO: return 14; // 21,000,000,000,000
+    case PHO: return 8; // 100,000,000 (# digits, without commas)
+    case mPHO: return 11; // 100,000,000,000
+    case uPHO: return 14; // 100,000,000,000,000
     default: return 0;
     }
 }
