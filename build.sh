@@ -14,7 +14,7 @@
 #   sidgrip/osxcross-base:latest   — macOS cross-compiler (osxcross)
 #   sidgrip/appimage-base:22.04    — AppImage builder (Wayland compatible)
 #
-# Repository: https://github.com/SidGrip/photon
+# Repository: https://github.com/BlueDragon747/photon
 # =============================================================================
 
 set -euo pipefail
@@ -25,7 +25,7 @@ COIN_NAME="photon"
 COIN_NAME_UPPER="Photon"
 DAEMON_NAME="photond"
 QT_NAME="photon-qt"
-REPO_URL="https://github.com/SidGrip/photon.git"
+REPO_URL="https://github.com/BlueDragon747/photon.git"
 REPO_BRANCH="master"
 
 # Network ports and config

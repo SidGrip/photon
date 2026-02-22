@@ -27,7 +27,7 @@ Photon is the first Blake-256 merge-mined coin. As Photons are plentiful in the 
 ## Quick Start (Ubuntu 18.04)
 
 ```bash
-git clone https://github.com/SidGrip/photon.git
+git clone https://github.com/BlueDragon747/photon.git
 cd photon
 sudo add-apt-repository ppa:bitcoin/bitcoin
 sudo apt update
@@ -70,7 +70,7 @@ Other options:
 ## Platform Build Instructions
 
 ```bash
-git clone https://github.com/SidGrip/photon.git
+git clone https://github.com/BlueDragon747/photon.git
 cd photon
 ```
 
