@@ -7,7 +7,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleGetInfoString</key>
-        <string>$VERSION, Copyright © 2009-$YEAR The Bitcoin developers & Copyright © 2014-$YEAR Photon developers</string>
+        <!-- FIX: original had bare '&' which is invalid XML — macOS rejects the entire
+             plist, causing the icon (CFBundleIconFile) to not be read. Changed to &amp; -->
+        <string>$VERSION, Copyright © 2009-$YEAR The Bitcoin developers &amp; Copyright © 2014-$YEAR Photon developers</string>
 	<key>CFBundleShortVersionString</key>
         <string>$VERSION</string>
 	<key>CFBundleVersion</key>
