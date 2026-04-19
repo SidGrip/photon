@@ -1,53 +1,77 @@
 #!/bin/bash
 # =============================================================================
-# Photon Build Script — All Platforms
+# Photon 0.15.2 Build Script  -  All Platforms
 #
 # Single self-contained script to build Photon daemon and/or Qt wallet
 # for Linux, macOS, Windows, and AppImage.
+#
+# Based on Bitcoin Core 0.15.2  -  uses autotools (./configure + make).
+# Windows cross-compilation still uses pre-built libraries in the Docker image.
+# macOS cross-compilation now defaults to a depends + CONFIG_SITE flow inside
+# the Docker image, with the older pre-built-libs path kept as a fallback.
 #
 # Usage: ./build.sh [PLATFORM] [TARGET] [OPTIONS]
 #   See ./build.sh --help for full usage.
 #
 # Docker Hub images (prebuilt):
-#   sidgrip/native-base:18.04      — Linux native build environment
-#   sidgrip/mxe-base:latest        — Windows cross-compiler (MXE)
-#   sidgrip/osxcross-base:latest   — macOS cross-compiler (osxcross)
-#   sidgrip/appimage-base:22.04    — AppImage builder (Wayland compatible)
+#   sidgrip/native-base:20.04      -  Native Linux (Ubuntu 20.04, GCC 9, Boost 1.71)
+#   sidgrip/native-base:22.04      -  Native Linux (Ubuntu 22.04, GCC 11, Boost 1.74)
+#   sidgrip/native-base:24.04      -  Native Linux (Ubuntu 24.04, GCC 13, Boost 1.83)
+#   sidgrip/native-base:25.10      -  Native Linux (Ubuntu 25.10, GCC 15, Boost 1.88)
+#   sidgrip/appimage-base:22.04    -  AppImage builds (Ubuntu 22.04 + appimagetool)
+#   sidgrip/mxe-base:latest        -  Windows cross-compile (MXE + MinGW)
+#   sidgrip/osxcross-base:sdk-26.2  -  macOS cross-compile (depends + osxcross SDK 26.2)
 #
-# Repository: https://github.com/BlueDragon747/photon
+# Repository: https://github.com/BlueDragon747/Photon (branch: master)
 # =============================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUTPUT_BASE="$SCRIPT_DIR/outputs"
+OUTPUT_BASE="${OUTPUT_BASE:-$SCRIPT_DIR/outputs}"
 COIN_NAME="photon"
 COIN_NAME_UPPER="Photon"
 DAEMON_NAME="photond"
 QT_NAME="photon-qt"
+CLI_NAME="photon-cli"
+TX_NAME="photon-tx"
+VERSION="0.15.2"
 REPO_URL="https://github.com/BlueDragon747/photon.git"
 REPO_BRANCH="master"
+QT_LINUX_LAUNCHER_SOURCE="$SCRIPT_DIR/contrib/linux-release/blakecoin-qt-launcher.c"
+APPIMAGE_PUBLIC_NAME="${COIN_NAME_UPPER}-${VERSION}-x86_64.AppImage"
+WINDOWS_ICON_SOURCE_PNG="$SCRIPT_DIR/src/qt/res/icons/bitcoin.png"
+WINDOWS_ICON_SOURCE_TESTNET_PNG="$SCRIPT_DIR/src/qt/res/icons/bitcoin_testnet.png"
+WINDOWS_EXE_ICON_ICO="$SCRIPT_DIR/src/qt/res/icons/Blakecoin_32.ico"
+WINDOWS_EXE_ICON_TESTNET_ICO="$SCRIPT_DIR/src/qt/res/icons/Blakecoin_32_testnet.ico"
+WINDOWS_INSTALLER_ICON_ICO="$SCRIPT_DIR/share/pixmaps/Blakecoin.ico"
+BDB_PACKAGE_MK="$SCRIPT_DIR/depends/packages/bdb.mk"
+BDB_CACHE_ROOT="$SCRIPT_DIR/.cache/bdb"
+NATIVE_LINUX_ALL_DEPS=()
+NATIVE_LINUX_ALL_DEPS_STR=""
+CURRENT_OUTPUT_DIR=""
+GENERATE_CONFIG_AFTER_BUILD=0
 
 # Network ports and config
 RPC_PORT=8984
 P2P_PORT=35556
-CHAINZ_CODE="pho"
+EXPLORER_API_BASE="https://explorer.blakestream.io/api"
+EXPLORER_COIN_ID="pho"
 CONFIG_FILE="${COIN_NAME}.conf"
-CONFIG_DIR=".${COIN_NAME}"
+LISTEN='listen=1'
+DAEMON='daemon=1'
+SERVER='server=1'
+TXINDEX='txindex=0'
 
 # Docker images
-DOCKER_NATIVE="sidgrip/native-base:18.04"
-DOCKER_WINDOWS="sidgrip/mxe-base:latest"
-DOCKER_MACOS="sidgrip/osxcross-base:latest"
-DOCKER_APPIMAGE="sidgrip/appimage-base:22.04"
+DOCKER_NATIVE="${DOCKER_NATIVE:-sidgrip/native-base:22.04}"
+DOCKER_APPIMAGE="${DOCKER_APPIMAGE:-sidgrip/appimage-base:22.04}"
+DOCKER_WINDOWS="${DOCKER_WINDOWS:-sidgrip/mxe-base:latest}"
+DOCKER_MACOS="${DOCKER_MACOS:-sidgrip/osxcross-base:sdk-26.2}"
 
-# MXE paths (Windows cross-compile)
-MXE_SYSROOT="/opt/mxe/usr/x86_64-w64-mingw32.static"
-
-# osxcross paths (macOS cross-compile)
-OSXCROSS_TARGET="/opt/osxcross/target"
-OSXCROSS_HOST="x86_64-apple-darwin25.2"
-MACPORTS_PREFIX="/opt/osxcross/target/macports/pkgs/opt/local"
+# Cross-compile host triplets
+WIN_HOST="x86_64-w64-mingw32.static"
+MAC_HOST=""  # Auto-detected from Docker image at build time
 
 # Colors
 RED='\033[0;31m'
@@ -65,12 +89,151 @@ success() { echo -e "${GREEN}[OK]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; }
 
+# Fix execute permissions after copying source tree (rsync/cp can lose +x bits)
+fix_permissions() {
+    local dir="$1"
+    find "$dir" -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
+    find "$dir" -name 'config.guess' -o -name 'config.sub' -o -name 'install-sh' \
+        -o -name 'missing' -o -name 'compile' -o -name 'depcomp' \
+        -o -name 'build_detect_platform' -o -name 'autogen.sh' \
+        | xargs chmod +x 2>/dev/null || true
+}
+
+copy_source_tree_to_tempdir() {
+    local dest="$1"
+
+    rsync -a \
+        --exclude '.git' \
+        --exclude 'outputs' \
+        --exclude 'staging' \
+        --exclude '.cache' \
+        --exclude '.electrum-builds' \
+        --exclude '.ubuntu-builds' \
+        "$SCRIPT_DIR"/ "$dest/"
+}
+
+clean_stale_build_artifacts() {
+    local dir="$1"
+
+    # Container cross-builds copy the working tree as-is, so stale autotools and
+    # libtool outputs from prior native builds can make make believe targets are
+    # already satisfied even when their companion objects are missing.
+    find "$dir" -type d \( -name '.deps' -o -name '.libs' -o -name 'autom4te.cache' \) \
+        -prune -exec rm -rf {} + 2>/dev/null || true
+
+    find "$dir" -type f \( \
+        -name 'config.status' -o \
+        -name 'config.log' -o \
+        -name 'config.cache' -o \
+        -name 'libtool' -o \
+        -name '*.o' -o \
+        -name '*.lo' -o \
+        -name '*.la' -o \
+        -name '*.obj' -o \
+        -name '*.a' -o \
+        -name '*.exe' -o \
+        -name '*.res' -o \
+        -name '*.pdb' -o \
+        -name '*.Tpo' -o \
+        -name '*.Plo' -o \
+        -name '*.Po' -o \
+        -name '*.trs' -o \
+        -name '*.dirstamp' \
+    \) -delete 2>/dev/null || true
+
+    # Cross-builds should regenerate Qt/protobuf build products with the
+    # container's own moc/uic/rcc/protoc so host-generated files don't leak in.
+    find "$dir/src/qt" -maxdepth 1 -type f \( \
+        -name '*.moc' -o \
+        -name 'moc_*.cpp' -o \
+        -name 'paymentrequest.pb.cc' -o \
+        -name 'paymentrequest.pb.h' \
+    \) -delete 2>/dev/null || true
+
+    find "$dir/src/qt/forms" -maxdepth 1 -type f -name 'ui_*.h' \
+        -delete 2>/dev/null || true
+}
+
 # Portable sed -i wrapper (macOS BSD sed requires '' arg, GNU sed does not)
 sedi() {
     if [[ "$(uname -s)" == "Darwin" ]]; then
         sed -i '' "$@"
     else
         sed -i "$@"
+    fi
+}
+
+ensure_windows_icon_assets() {
+    local missing=()
+    local path
+
+    for path in \
+        "$WINDOWS_ICON_SOURCE_PNG" \
+        "$WINDOWS_ICON_SOURCE_TESTNET_PNG" \
+        "$WINDOWS_EXE_ICON_ICO" \
+        "$WINDOWS_EXE_ICON_TESTNET_ICO" \
+        "$WINDOWS_INSTALLER_ICON_ICO"
+    do
+        [[ -f "$path" ]] || missing+=("$path")
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        error "Missing required Windows icon asset(s):"
+        printf '  %s\n' "${missing[@]}"
+        exit 1
+    fi
+
+    info "Windows branding source (main): $WINDOWS_ICON_SOURCE_PNG"
+    info "Windows branding source (testnet): $WINDOWS_ICON_SOURCE_TESTNET_PNG"
+    info "Windows embedded exe icon (main): $WINDOWS_EXE_ICON_ICO"
+    info "Windows embedded exe icon (testnet): $WINDOWS_EXE_ICON_TESTNET_ICO"
+    info "Windows installer icon: $WINDOWS_INSTALLER_ICON_ICO"
+}
+
+ensure_macos_brew_env() {
+    local brew_bin=""
+
+    if command -v brew &>/dev/null; then
+        brew_bin=$(command -v brew)
+    else
+        for brew_bin in /opt/homebrew/bin/brew /usr/local/bin/brew "$HOME/homebrew/bin/brew"; do
+            [[ -x "$brew_bin" ]] && break
+        done
+    fi
+
+    if [[ -n "$brew_bin" && -x "$brew_bin" ]]; then
+        eval "$("$brew_bin" shellenv)" >/dev/null 2>&1 || true
+        export PATH="$(dirname "$brew_bin"):$PATH"
+        return 0
+    fi
+
+    return 1
+}
+
+prime_macos_sudo() {
+    if sudo -n true 2>/dev/null; then
+        return 0
+    fi
+
+    if [[ -n "${MACOS_SUDO_PASS:-}" ]]; then
+        printf '%s\n' "$MACOS_SUDO_PASS" | sudo -S -p '' -v
+    else
+        sudo -v
+    fi
+}
+
+ensure_macos_homebrew() {
+    if ensure_macos_brew_env; then
+        return 0
+    fi
+
+    info "Homebrew not found  -  installing it automatically..."
+    prime_macos_sudo
+    NONINTERACTIVE=1 CI=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+    if ! ensure_macos_brew_env; then
+        error "Homebrew installation completed but brew is still not available."
+        exit 1
     fi
 }
 
@@ -85,7 +248,7 @@ Platforms:
   --macos           Cross-compile for macOS from Linux (requires Docker)
 
 Targets:
-  --daemon          Build daemon only (photond)
+  --daemon          Build daemon only (photond + photon-cli + photon-tx)
   --qt              Build Qt wallet only (photon-qt)
   --both            Build daemon and Qt wallet (default)
 
@@ -104,26 +267,22 @@ Examples:
   ./build.sh --native --daemon                 # Daemon only
 
   # Native Linux with Docker
-  ./build.sh --native --both --pull-docker     # Use native-base from Docker Hub
-  ./build.sh --native --both --build-docker    # Build native-base locally first
+  ./build.sh --native --both --pull-docker     # Use appimage-base from Docker Hub
+  ./build.sh --native --both --build-docker    # Same as --pull-docker (shared images)
 
-  # Cross-compile (Docker required — choose --pull-docker or --build-docker)
+  # Cross-compile (Docker required  -  choose --pull-docker or --build-docker)
   ./build.sh --windows --qt --pull-docker      # Pull mxe-base from Docker Hub
-  ./build.sh --windows --qt --build-docker     # Build mxe-base locally
   ./build.sh --macos --qt --pull-docker        # Pull osxcross-base from Docker Hub
   ./build.sh --appimage --pull-docker          # Pull appimage-base from Docker Hub
 
-Docker Hub images (prebuilt, used with --pull-docker):
-  sidgrip/native-base:18.04            Linux build environment (~320 MB)
-  sidgrip/mxe-base:latest              Windows MXE cross-compiler (~4.2 GB)
-  sidgrip/osxcross-base:latest         macOS osxcross cross-compiler (~7.2 GB)
-  sidgrip/appimage-base:22.04          AppImage builder (~515 MB)
-
-Local Dockerfiles (used with --build-docker):
-  docker/Dockerfile.native-base        Linux build environment (~5 min)
-  docker/Dockerfile.mxe-base           Windows MXE cross-compiler (~2-4 hours)
-  docker/Dockerfile.osxcross-base      macOS osxcross cross-compiler (~1-2 hours)
-  docker/Dockerfile.appimage-base      AppImage builder (~15 min)
+Docker Hub images (used with --pull-docker):
+  sidgrip/native-base:20.04             Native Linux (Ubuntu 20.04, GCC 9)
+  sidgrip/native-base:22.04             Native Linux (Ubuntu 22.04, GCC 11) [default]
+  sidgrip/native-base:24.04             Native Linux (Ubuntu 24.04, GCC 13)
+  sidgrip/native-base:25.10             Native Linux (Ubuntu 25.10, GCC 15)
+  sidgrip/appimage-base:22.04           AppImage (Ubuntu 22.04 + appimagetool)
+  sidgrip/mxe-base:latest               Windows cross-compile (MXE + MinGW)
+  sidgrip/osxcross-base:sdk-26.2        macOS cross-compile (depends + osxcross SDK 26.2) [default]
 EOF
     exit 0
 }
@@ -142,7 +301,6 @@ detect_os_version() {
     local os="$1"
     case "$os" in
         linux)
-            # Linux: lsb_release or /etc/os-release
             if command -v lsb_release &>/dev/null; then
                 lsb_release -ds 2>/dev/null
             elif [[ -f /etc/os-release ]]; then
@@ -164,6 +322,373 @@ detect_os_version() {
     esac
 }
 
+normalize_ubuntu_output_label() {
+    local ubuntu_ver="${1:-unknown}"
+
+    case "$ubuntu_ver" in
+        20.04*) echo "Ubuntu-20" ;;
+        22.04*) echo "Ubuntu-22" ;;
+        24.04*) echo "Ubuntu-24" ;;
+        25.10*) echo "Ubuntu-25" ;;
+        *)
+            local major="${ubuntu_ver%%.*}"
+            if [[ -n "$major" && "$major" != "$ubuntu_ver" ]]; then
+                echo "Ubuntu-$major"
+            elif [[ "$ubuntu_ver" =~ ^[0-9]+$ ]]; then
+                echo "Ubuntu-$ubuntu_ver"
+            else
+                echo "Ubuntu"
+            fi
+            ;;
+    esac
+}
+
+linux_output_dir() {
+    local ubuntu_ver="${1:-unknown}"
+    printf '%s/%s\n' "$OUTPUT_BASE" "$(normalize_ubuntu_output_label "$ubuntu_ver")"
+}
+
+windows_output_dir() {
+    printf '%s/Windows\n' "$OUTPUT_BASE"
+}
+
+macos_output_dir() {
+    printf '%s/Macosx\n' "$OUTPUT_BASE"
+}
+
+appimage_output_dir() {
+    printf '%s/AppImage\n' "$OUTPUT_BASE"
+}
+
+cleanup_target_output_dir() {
+    local output_dir="$1"
+
+    rm -rf "$output_dir"
+    mkdir -p "$output_dir"
+}
+
+cleanup_legacy_output_root() {
+    mkdir -p "$OUTPUT_BASE"
+
+    rm -f \
+        "$OUTPUT_BASE/$DAEMON_NAME" \
+        "$OUTPUT_BASE/$CLI_NAME" \
+        "$OUTPUT_BASE/$TX_NAME" \
+        "$OUTPUT_BASE/$QT_NAME" \
+        "$OUTPUT_BASE/${QT_NAME}-bin" \
+        "$OUTPUT_BASE/${DAEMON_NAME}.exe" \
+        "$OUTPUT_BASE/${CLI_NAME}.exe" \
+        "$OUTPUT_BASE/${TX_NAME}.exe" \
+        "$OUTPUT_BASE/${QT_NAME}.exe" \
+        "$OUTPUT_BASE/${DAEMON_NAME}-${VERSION}" \
+        "$OUTPUT_BASE/${CLI_NAME}-${VERSION}" \
+        "$OUTPUT_BASE/${TX_NAME}-${VERSION}" \
+        "$OUTPUT_BASE/${QT_NAME}-${VERSION}" \
+        "$OUTPUT_BASE/${DAEMON_NAME}-${VERSION}.exe" \
+        "$OUTPUT_BASE/${CLI_NAME}-${VERSION}.exe" \
+        "$OUTPUT_BASE/${TX_NAME}-${VERSION}.exe" \
+        "$OUTPUT_BASE/${QT_NAME}-${VERSION}.exe" \
+        "$OUTPUT_BASE/install-deps.sh" \
+        "$OUTPUT_BASE/${COIN_NAME}.desktop" \
+        "$OUTPUT_BASE/${COIN_NAME}-256.png" \
+        "$OUTPUT_BASE/photon.conf" \
+        "$OUTPUT_BASE/qt.conf" \
+        "$OUTPUT_BASE/README.md" \
+        "$OUTPUT_BASE/build-info.txt"
+
+    rm -rf \
+        "$OUTPUT_BASE/.runtime" \
+        "$OUTPUT_BASE/lib" \
+        "$OUTPUT_BASE/plugins" \
+        "$OUTPUT_BASE/platforms" \
+        "$OUTPUT_BASE/Photon-Qt.app" \
+        "$OUTPUT_BASE/native" \
+        "$OUTPUT_BASE/windows" \
+        "$OUTPUT_BASE/macos" \
+        "$OUTPUT_BASE/windows-native" \
+        "$OUTPUT_BASE/macos-native" \
+        "$OUTPUT_BASE/daemon" \
+        "$OUTPUT_BASE/qt" \
+        "$OUTPUT_BASE/appimage" \
+        "$OUTPUT_BASE/release"
+
+    shopt -s nullglob
+    local stale_dlls=("$OUTPUT_BASE"/*.dll)
+    local stale_ubuntu_dirs=("$OUTPUT_BASE"/photon-v${VERSION}-ubuntu-*-x86_64 "$OUTPUT_BASE"/photon-v${VERSION}-ubuntu-*-x86_64-daemon "$OUTPUT_BASE"/photon-v${VERSION}-ubuntu-*-x86_64-qt)
+    local stale_ubuntu_archives=("$OUTPUT_BASE"/photon-v${VERSION}-ubuntu-*-x86_64.tar.gz)
+    shopt -u nullglob
+
+    if [[ ${#stale_dlls[@]} -gt 0 ]]; then
+        rm -f "${stale_dlls[@]}"
+    fi
+    if [[ ${#stale_ubuntu_dirs[@]} -gt 0 ]]; then
+        rm -rf "${stale_ubuntu_dirs[@]}"
+    fi
+    if [[ ${#stale_ubuntu_archives[@]} -gt 0 ]]; then
+        rm -f "${stale_ubuntu_archives[@]}"
+    fi
+}
+
+bdb_recipe_version() {
+    awk -F= '/^\$\(package\)_version=/{print $2}' "$BDB_PACKAGE_MK"
+}
+
+bdb_recipe_sha256() {
+    awk -F= '/^\$\(package\)_sha256_hash=/{print $2}' "$BDB_PACKAGE_MK"
+}
+
+sha256_file() {
+    local file="$1"
+
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$file" | awk '{print $1}'
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    else
+        error "No SHA256 tool found (need sha256sum or shasum)"
+        exit 1
+    fi
+}
+
+native_bdb48_prefix() {
+    local host_id="$1"
+    printf '%s/4.8/%s\n' "$BDB_CACHE_ROOT" "$host_id"
+}
+
+ensure_repo_bdb48() {
+    local platform="$1"
+    local host_id="$2"
+    local jobs="$3"
+    local prefix=""
+    local prefix_tmp=""
+    local sources_dir=""
+    local build_root=""
+    local version=""
+    local sha256=""
+    local archive_name=""
+    local archive_path=""
+    local dist_name=""
+    local build_dir=""
+    local machine=""
+    local actual_sha=""
+    local configure_cmd=()
+
+    prefix="$(native_bdb48_prefix "$host_id")"
+    prefix_tmp="${prefix}.tmp"
+    sources_dir="$BDB_CACHE_ROOT/sources"
+    build_root="$BDB_CACHE_ROOT/work/$host_id"
+    version="$(bdb_recipe_version)"
+    sha256="$(bdb_recipe_sha256)"
+    archive_name="db-${version}.NC.tar.gz"
+    archive_path="$sources_dir/$archive_name"
+    dist_name="db-${version}.NC"
+    build_dir="$build_root/$dist_name/build_unix"
+
+    if [[ -f "$prefix/include/db_cxx.h" && -f "$prefix/lib/libdb_cxx-4.8.a" && -f "$prefix/lib/libdb-4.8.a" ]]; then
+        echo "$prefix"
+        return 0
+    fi
+
+    mkdir -p "$sources_dir" "$(dirname "$prefix")"
+
+    if [[ ! -f "$archive_path" ]]; then
+        info "Downloading Berkeley DB 4.8.30.NC source..." >&2
+        curl -L "https://download.oracle.com/berkeley-db/$archive_name" -o "${archive_path}.tmp"
+        mv "${archive_path}.tmp" "$archive_path"
+    fi
+
+    actual_sha="$(sha256_file "$archive_path")"
+    if [[ "$actual_sha" != "$sha256" ]]; then
+        error "Berkeley DB source hash mismatch for $archive_name" >&2
+        error "Expected: $sha256" >&2
+        error "Actual:   $actual_sha" >&2
+        exit 1
+    fi
+
+    info "Bootstrapping Berkeley DB 4.8.30.NC for $host_id..." >&2
+    rm -rf "$build_root" "$prefix_tmp"
+    mkdir -p "$build_root"
+    tar -xzf "$archive_path" -C "$build_root"
+
+    pushd "$build_dir" >/dev/null
+
+    sed -i.bak 's/__atomic_compare_exchange/__atomic_compare_exchange_db/g' ../dbinc/atomic.h
+    while IFS= read -r -d '' source_file; do
+        sed -i.bak 's/\batomic_init\b/bdb_atomic_init/g' "$source_file"
+    done < <(find .. \( -name '*.h' -o -name '*.c' -o -name '*.cpp' \) -print0)
+    find .. -name '*.bak' -delete 2>/dev/null || true
+    cp -f "$SCRIPT_DIR/depends/config.guess" "$SCRIPT_DIR/depends/config.sub" ../dist/
+
+    configure_cmd=(
+        ../dist/configure
+        --prefix="$prefix_tmp"
+        --enable-cxx
+        --disable-shared
+        --disable-replication
+        --disable-atomicsupport
+    )
+
+    case "$platform" in
+        linux)
+            configure_cmd+=(--with-pic --with-mutex=POSIX/pthreads)
+            ;;
+        mingw)
+            machine="$(gcc -dumpmachine 2>/dev/null || true)"
+            [[ -n "$machine" ]] && configure_cmd+=(--host="$machine")
+            configure_cmd+=(--enable-mingw)
+            ;;
+        *)
+            error "Unsupported Berkeley DB bootstrap platform: $platform" >&2
+            exit 1
+            ;;
+    esac
+
+    env CFLAGS="-O2" CXXFLAGS="-O2 -std=c++11" "${configure_cmd[@]}" >&2
+    make -j"$jobs" libdb_cxx-4.8.a libdb-4.8.a >&2
+
+    mkdir -p "$prefix_tmp/lib" "$prefix_tmp/include"
+
+    if [[ ! -f db.h || ! -f db_cxx.h ]]; then
+        error "Failed to locate Berkeley DB headers in $build_dir" >&2
+        exit 1
+    fi
+
+    cp -f db.h "$prefix_tmp/include/db.h"
+    cp -f db_cxx.h "$prefix_tmp/include/db_cxx.h"
+    cp -f libdb-4.8.a "$prefix_tmp/lib/libdb-4.8.a"
+    cp -f libdb_cxx-4.8.a "$prefix_tmp/lib/libdb_cxx-4.8.a"
+
+    if [[ -f libdb.a ]]; then
+        cp -f libdb.a "$prefix_tmp/lib/libdb.a"
+    else
+        cp -f libdb-4.8.a "$prefix_tmp/lib/libdb.a"
+    fi
+
+    if [[ -f libdb_cxx.a ]]; then
+        cp -f libdb_cxx.a "$prefix_tmp/lib/libdb_cxx.a"
+    else
+        cp -f libdb_cxx-4.8.a "$prefix_tmp/lib/libdb_cxx.a"
+    fi
+
+    popd >/dev/null
+
+    rm -rf "$prefix"
+    mv "$prefix_tmp" "$prefix"
+    rm -rf "$build_root"
+
+    echo "$prefix"
+}
+
+verify_bdb48_prefix() {
+    local prefix="$1"
+    local label="$2"
+
+    if [[ ! -f "$prefix/include/db_cxx.h" ]]; then
+        error "$label is missing Berkeley DB 4.8 headers at $prefix/include/db_cxx.h"
+        return 1
+    fi
+
+    if ! compgen -G "$prefix/lib/libdb_cxx-4.8*" >/dev/null; then
+        error "$label is missing Berkeley DB 4.8 C++ libraries under $prefix/lib"
+        return 1
+    fi
+
+    if ! compgen -G "$prefix/lib/libdb-4.8*" >/dev/null; then
+        error "$label is missing Berkeley DB 4.8 libraries under $prefix/lib"
+        return 1
+    fi
+}
+
+native_linux_link_command() {
+    local target="$1"
+    local cmd=""
+
+    pushd "$SCRIPT_DIR/src" >/dev/null
+    cmd="$(make -n V=1 "$target" 2>/dev/null | awk '/\/libtool[[:space:]].*--mode=link/ { line=$0 } END { if (line != "") print line; else exit 1 }')"
+    popd >/dev/null
+
+    [[ -n "$cmd" ]] || return 1
+    printf '%s\n' "$cmd"
+}
+
+relink_native_linux_target() {
+    local target="$1"
+    local artifact="$2"
+    local cmd=""
+
+    cmd="$(native_linux_link_command "$target")" || {
+        error "Failed to capture native Linux link command for $target"
+        return 1
+    }
+
+    pushd "$SCRIPT_DIR/src" >/dev/null
+    bash -lc "$cmd" >/dev/null
+    popd >/dev/null
+
+    if objdump -p "$artifact" 2>/dev/null | grep -Eq 'libdb(_cxx)?-5\.3\.so'; then
+        error "Native Linux post-link verification failed for $artifact"
+        return 1
+    fi
+}
+
+ensure_windows_native_shell() {
+    local target="$1"
+    local jobs="$2"
+    local msys_root="/c/msys64"
+    local msys_bash="$msys_root/usr/bin/bash.exe"
+    local msys_env="$msys_root/usr/bin/env.exe"
+    local target_flag="--both"
+    local reexec_cmd=""
+
+    case "$target" in
+        daemon) target_flag="--daemon" ;;
+        qt)     target_flag="--qt" ;;
+        both)   target_flag="--both" ;;
+    esac
+
+    if [[ "${MSYSTEM:-}" == "MINGW64" ]] && command -v pacman &>/dev/null; then
+        return 0
+    fi
+
+    if ! command -v powershell.exe &>/dev/null; then
+        error "PowerShell is required to bootstrap native Windows builds."
+        exit 1
+    fi
+
+    if [[ ! -x "$msys_bash" || ! -x "$msys_env" ]]; then
+        info "MSYS2 not found  -  installing it automatically..."
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -Command '
+            $ErrorActionPreference = "Stop"
+            $msysUrl = "https://github.com/msys2/msys2-installer/releases/download/nightly-x86_64/msys2-base-x86_64-latest.sfx.exe"
+            $msysExe = "$env:TEMP\msys2-base-x86_64-latest.sfx.exe"
+            Invoke-WebRequest -UseBasicParsing -Uri $msysUrl -OutFile $msysExe
+            & $msysExe "-y" "-oC:\"
+        '
+    fi
+
+    if [[ ! -x "$msys_bash" || ! -x "$msys_env" ]]; then
+        error "MSYS2 installation did not produce $msys_bash"
+        exit 1
+    fi
+
+    info "Initializing MSYS2..."
+    "$msys_env" MSYSTEM=MINGW64 CHERE_INVOKING=yes MSYS2_PATH_TYPE=inherit \
+        "$msys_bash" -lc '
+            set +e
+            pacman-key --init >/dev/null 2>&1
+            pacman-key --populate msys2 >/dev/null 2>&1
+            pacman --noconfirm -Sy >/dev/null 2>&1
+            pacman --noconfirm -Syuu >/dev/null 2>&1
+            pacman --noconfirm -Syuu >/dev/null 2>&1
+            exit 0
+        '
+
+    printf -v reexec_cmd 'cd %q && ./build.sh --native %s --jobs %q' "$SCRIPT_DIR" "$target_flag" "$jobs"
+    info "Re-entering build.sh inside MSYS2 MINGW64..."
+    exec "$msys_env" MSYSTEM=MINGW64 CHERE_INVOKING=yes MSYS2_PATH_TYPE=inherit \
+        "$msys_bash" -lc "$reexec_cmd"
+}
+
 write_build_info() {
     local output_dir="$1"
     local platform="$2"
@@ -172,7 +697,7 @@ write_build_info() {
 
     mkdir -p "$output_dir"
     cat > "$output_dir/build-info.txt" <<EOF
-Coin:       $COIN_NAME_UPPER
+Coin:       $COIN_NAME_UPPER 0.15.2
 Target:     $target
 Platform:   $platform
 OS:         $os_version
@@ -182,43 +707,912 @@ Script:     build.sh
 EOF
 }
 
-generate_config() {
-    local platform="${1:-}"
-    local conf_path="$OUTPUT_BASE/$CONFIG_FILE"
-    if [[ -f "$conf_path" ]]; then
-        info "Config already exists: $conf_path"
+copy_runtime_libs() {
+    local binary="$1"
+    local dest_dir="$2"
+
+    mkdir -p "$dest_dir"
+    while IFS= read -r lib; do
+        [[ -n "$lib" && -r "$lib" ]] || continue
+        case "$(basename "$lib")" in
+            ld-linux-*|libc.so.*|libdl.so.*|libm.so.*|libpthread.so.*|librt.so.*|libresolv.so.*|libutil.so.*|libnsl.so.*|libanl.so.*)
+                continue
+                ;;
+        esac
+        cp -Lf "$lib" "$dest_dir/"
+    done < <(
+        ldd "$binary" 2>/dev/null | awk '
+            /=> \// {print $3}
+            /^\// {print $1}
+        ' | sort -u
+    )
+}
+
+is_macos_system_dylib() {
+    case "$1" in
+        /System/Library/*|/usr/lib/*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+resolve_macos_bundle_dep_target() {
+    local dep="$1"
+    local subject="$2"
+    local main_exe_dir="$3"
+    local frameworks_dir="$4"
+
+    case "$dep" in
+        @executable_path/*)
+            printf '%s\n' "$main_exe_dir/${dep#@executable_path/}"
+            ;;
+        @loader_path/*)
+            printf '%s\n' "$(dirname "$subject")/${dep#@loader_path/}"
+            ;;
+        @rpath/*)
+            local rel="${dep#@rpath/}"
+            if [[ -e "$frameworks_dir/$rel" ]]; then
+                printf '%s\n' "$frameworks_dir/$rel"
+            else
+                printf '%s\n' "$frameworks_dir/$(basename "$dep")"
+            fi
+            ;;
+        *)
+            printf '%s\n' "$dep"
+            ;;
+    esac
+}
+
+find_macos_source_dylib() {
+    local dylib_name="$1"
+    shift
+
+    local search_dir=""
+    for search_dir in "$@"; do
+        [[ -n "$search_dir" && -d "$search_dir" ]] || continue
+        if [[ -f "$search_dir/$dylib_name" ]]; then
+            printf '%s\n' "$search_dir/$dylib_name"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+bundle_macos_transitive_dylibs() {
+    local app_dir="$1"
+    shift
+
+    local frameworks_dir="$app_dir/Contents/Frameworks"
+    local main_exe_dir="$app_dir/Contents/MacOS"
+    local main_exe="$main_exe_dir/Photon-Qt"
+    local search_dirs=("$@")
+    local pass=0
+    local changed=1
+
+    [[ -f "$main_exe" && -d "$frameworks_dir" ]] || return 0
+
+    while [[ $changed -eq 1 && $pass -lt 10 ]]; do
+        changed=0
+        pass=$((pass + 1))
+
+        local subject=""
+        local dep=""
+        local dep_target=""
+        local dep_name=""
+        local source_lib=""
+        local bundled_lib=""
+        local new_ref=""
+        while IFS= read -r subject; do
+            [[ -f "$subject" ]] || continue
+            while IFS= read -r dep; do
+                [[ -n "$dep" ]] || continue
+                if is_macos_system_dylib "$dep"; then
+                    continue
+                fi
+
+                dep_target=$(resolve_macos_bundle_dep_target "$dep" "$subject" "$main_exe_dir" "$frameworks_dir")
+                if [[ -n "$dep_target" && -e "$dep_target" ]]; then
+                    continue
+                fi
+
+                dep_name=$(basename "$dep")
+                source_lib=$(find_macos_source_dylib "$dep_name" "${search_dirs[@]}" || true)
+                [[ -n "$source_lib" ]] || continue
+
+                bundled_lib="$frameworks_dir/$dep_name"
+                if [[ ! -f "$bundled_lib" ]]; then
+                    cp -f "$source_lib" "$bundled_lib"
+                    chmod u+w "$bundled_lib" 2>/dev/null || true
+                    install_name_tool -id "@executable_path/../Frameworks/$dep_name" "$bundled_lib" 2>/dev/null || true
+                    changed=1
+                fi
+
+                if [[ "$subject" == "$main_exe" ]]; then
+                    new_ref="@executable_path/../Frameworks/$dep_name"
+                else
+                    new_ref="@loader_path/$dep_name"
+                fi
+                install_name_tool -change "$dep" "$new_ref" "$subject" 2>/dev/null || true
+            done < <(otool -L "$subject" 2>/dev/null | tail -n +2 | awk '{print $1}')
+        done < <(
+            printf '%s\n' "$main_exe"
+            find "$frameworks_dir" -maxdepth 1 -type f -name '*.dylib' | sort
+        )
+    done
+}
+
+compile_linux_qt_launcher() {
+    local output_path="$1"
+    local target_rel="${2:-.runtime/${QT_NAME}-bin}"
+    local use_runtime_env="${3:-1}"
+    local launcher_cc="${CC:-}"
+    local output_dir=""
+    local output_name=""
+    local gcc_args=(
+        -O2
+        -s
+        -Wall
+        -Wextra
+        -no-pie
+        "-DBLAKECOIN_QT_LAUNCH_TARGET=\"${target_rel}\""
+        "-DBLAKECOIN_QT_USE_RUNTIME_ENV=${use_runtime_env}"
+    )
+
+    [[ -f "$QT_LINUX_LAUNCHER_SOURCE" ]] || {
+        error "Linux Qt launcher source not found: $QT_LINUX_LAUNCHER_SOURCE"
+        exit 1
+    }
+
+    if [[ -z "$launcher_cc" ]]; then
+        for candidate in gcc cc clang; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+                launcher_cc="$candidate"
+                break
+            fi
+        done
+    fi
+
+    [[ -n "$launcher_cc" ]] || {
+        if command -v docker >/dev/null 2>&1 && [[ -n "${DOCKER_NATIVE:-}" ]]; then
+            output_dir="$(cd "$(dirname "$output_path")" && pwd)"
+            output_name="$(basename "$output_path")"
+            docker run --rm \
+                -u "$(id -u):$(id -g)" \
+                -e BLAKECOIN_QT_LAUNCH_TARGET="$target_rel" \
+                -e BLAKECOIN_QT_USE_RUNTIME_ENV="$use_runtime_env" \
+                -e BLAKECOIN_QT_LAUNCH_OUTPUT="$output_name" \
+                -v "$SCRIPT_DIR:/repo:ro" \
+                -v "$output_dir:/out" \
+                "$DOCKER_NATIVE" \
+                /bin/bash -lc '
+set -e
+compiler=""
+for candidate in "${CC:-}" gcc cc clang; do
+    if [[ -n "$candidate" ]] && command -v "$candidate" >/dev/null 2>&1; then
+        compiler="$candidate"
+        break
+    fi
+done
+
+[[ -n "$compiler" ]] || {
+    echo "No usable C compiler found in Linux launcher fallback container" >&2
+    exit 1
+}
+
+"$compiler" -O2 -s -Wall -Wextra -no-pie \
+    "-DBLAKECOIN_QT_LAUNCH_TARGET=\"${BLAKECOIN_QT_LAUNCH_TARGET}\"" \
+    "-DBLAKECOIN_QT_USE_RUNTIME_ENV=${BLAKECOIN_QT_USE_RUNTIME_ENV}" \
+    /repo/contrib/linux-release/photon-qt-launcher.c \
+    -o "/out/${BLAKECOIN_QT_LAUNCH_OUTPUT}"
+'
+        else
+            error "No usable C compiler found for the Linux Qt launcher helper"
+            exit 1
+        fi
+        chmod +x "$output_path"
         return
+    }
+
+    # Ubuntu 20's default PIE launcher gets classified as application/x-sharedlib
+    # in GNOME, so force a normal executable for release-click behavior.
+    "$launcher_cc" "${gcc_args[@]}" "$QT_LINUX_LAUNCHER_SOURCE" -o "$output_path"
+    chmod +x "$output_path"
+}
+
+write_linux_release_desktop() {
+    local desktop_path="$1"
+
+    cat > "$desktop_path" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Photon Qt
+Comment=Photon Cryptocurrency Wallet
+Exec=photon-qt
+Icon=photon-qt
+Terminal=false
+Categories=Finance;Network;
+EOF
+}
+
+resolve_native_linux_packages() {
+    local target="$1"
+    local qt_deps=()
+
+    NATIVE_LINUX_ALL_DEPS=(
+        build-essential
+        libtool-bin
+        autotools-dev
+        automake
+        pkg-config
+        curl
+        libssl-dev
+        libevent-dev
+        libminiupnpc-dev
+        libprotobuf-dev
+        protobuf-compiler
+        libboost-all-dev
+    )
+
+    if [[ "$target" == "qt" || "$target" == "both" ]]; then
+        qt_deps=(qtbase5-dev qttools5-dev qttools5-dev-tools libqrencode-dev)
+        NATIVE_LINUX_ALL_DEPS+=("${qt_deps[@]}")
     fi
 
-    info "Generating $CONFIG_FILE..."
-    local rpcuser rpcpassword peers=""
-    rpcuser="rpcuser=$(head -c 100 /dev/urandom | LC_ALL=C tr -cd '[:alnum:]' | head -c 10)"
-    rpcpassword="rpcpassword=$(head -c 200 /dev/urandom | LC_ALL=C tr -cd '[:alnum:]' | head -c 22)"
+    NATIVE_LINUX_ALL_DEPS_STR="${NATIVE_LINUX_ALL_DEPS[*]}"
+}
 
-    # Ensure curl is available for peer fetching
-    if ! command -v curl &>/dev/null; then
-        if command -v apt-get &>/dev/null; then
-            info "Installing curl..."
-            sudo apt-get install -y -qq curl 2>/dev/null || true
-        fi
+write_linux_install_deps_script() {
+    local script_path="$1"
+    local install_packages="$2"
+
+    cat > "$script_path" <<EOF
+#!/bin/bash
+set -euo pipefail
+
+sudo apt-get update -qq
+sudo apt-get install -y -qq ${install_packages}
+EOF
+    chmod +x "$script_path"
+}
+
+write_linux_release_readme() {
+    local readme_path="$1"
+    local ubuntu_ver="$2"
+    local target="${3:-both}"
+    local install_packages="${4:-}"
+    local qt_launcher_note=""
+    local qt_copy_block="cp photon-qt ~/.local/bin/"
+    local qt_desktop_note=""
+
+    if [[ "$ubuntu_ver" == 20.04* ]]; then
+        qt_launcher_note=$'\nUbuntu 20.04 keeps `photon-qt` as a tiny launcher beside `photon-qt-bin` so GNOME treats it like an app instead of a shared library. Keep those two files together.\n'
+        qt_copy_block=$'cp photon-qt photon-qt-bin ~/.local/bin/'
+        qt_desktop_note=$'\nOn Ubuntu 20.04, copy `photon-qt-bin` beside it too.\n'
     fi
 
-    # Fetch active peers from chainz cryptoid
-    if command -v curl &>/dev/null; then
-        local nodes
-        nodes=$(curl -s "https://chainz.cryptoid.info/${CHAINZ_CODE}/api.dws?q=nodes" 2>/dev/null || true)
-        if [[ -n "$nodes" ]]; then
-            # Filter '^0\.' to exclude version strings (e.g. 0.8.9.7 from JSON "subver") — no valid public IP starts with 0
-            peers=$(grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' <<< "$nodes" | grep -v '^0\.' | sed 's/^/addnode=/' || true)
-        fi
-    fi
+    case "$target" in
+        daemon)
+            cat > "$readme_path" <<EOF
+# Photon v${VERSION} - Linux x86_64 (Ubuntu ${ubuntu_ver})
 
-    local upnp_line="upnp=1"
-    if [[ "$platform" == "macos" ]]; then
-        upnp_line="#upnp=1  # disabled on macOS (osxcross boost pthreads incompatibility)"
-    fi
+## Quick Start
+
+These are bare Ubuntu-native daemon binaries. Install the native Ubuntu packages first if this host does not already have them.
+
+### Install native Ubuntu runtime dependencies:
+\`\`\`bash
+chmod +x install-deps.sh
+./install-deps.sh
+\`\`\`
+
+Berkeley DB 4.8 is already handled by the build and is not installed from apt.
+
+Equivalent apt command:
+\`\`\`bash
+sudo apt-get update -qq
+sudo apt-get install -y -qq ${install_packages}
+\`\`\`
+
+### Start the daemon:
+\`\`\`bash
+./photond -daemon
+./photon-cli getinfo
+\`\`\`
+
+### Transaction utility:
+\`\`\`bash
+./photon-tx -help
+\`\`\`
+
+## Installation (optional)
+
+\`\`\`bash
+cp photond photon-cli photon-tx ~/.local/bin/
+\`\`\`
+
+After the native packages are installed, the daemon tools can live outside this folder.
+
+## Configuration
+
+On first run, a config file will be generated at \`~/.photon/photon.conf\` with random RPC credentials and peer nodes.
+
+- P2P port: 8773
+- RPC port: 8772
+
+## Build Info
+
+Built on Ubuntu ${ubuntu_ver}.
+EOF
+            ;;
+        qt)
+            cat > "$readme_path" <<EOF
+# Photon v${VERSION} - Linux x86_64 (Ubuntu ${ubuntu_ver})
+
+## Quick Start
+
+This is a bare Ubuntu-native Qt wallet binary. Install the native Ubuntu packages first if this host does not already have them.
+${qt_launcher_note}
+
+### Install native Ubuntu runtime dependencies:
+\`\`\`bash
+chmod +x install-deps.sh
+./install-deps.sh
+\`\`\`
+
+Berkeley DB 4.8 is already handled by the build and is not installed from apt.
+
+Equivalent apt command:
+\`\`\`bash
+sudo apt-get update -qq
+sudo apt-get install -y -qq ${install_packages}
+\`\`\`
+
+### Run the Qt wallet:
+\`\`\`bash
+./photon-qt
+\`\`\`
+
+## Installation (optional)
+
+\`\`\`bash
+mkdir -p ~/.local/bin
+${qt_copy_block}
+\`\`\`
+
+### Install desktop entry and icon:
+${qt_desktop_note}
+
+\`\`\`bash
+mkdir -p ~/.local/bin
+mkdir -p ~/.local/share/applications
+mkdir -p ~/.local/share/icons/hicolor/256x256/apps
+${qt_copy_block}
+cp ${COIN_NAME}.desktop ~/.local/share/applications/
+cp ${COIN_NAME}-256.png ~/.local/share/icons/hicolor/256x256/apps/photon-qt.png
+\`\`\`
+
+## Configuration
+
+On first run, a config file will be generated at \`~/.photon/photon.conf\` with random RPC credentials and peer nodes.
+
+- P2P port: 8773
+- RPC port: 8772
+
+## Build Info
+
+Built on Ubuntu ${ubuntu_ver}.
+EOF
+            ;;
+        both)
+            cat > "$readme_path" <<EOF
+# Photon v${VERSION} - Linux x86_64 (Ubuntu ${ubuntu_ver})
+
+## Quick Start
+
+These are bare Ubuntu-native binaries. Install the native Ubuntu packages first if this host does not already have them.
+${qt_launcher_note}
+
+### Install native Ubuntu runtime dependencies:
+\`\`\`bash
+chmod +x install-deps.sh
+./install-deps.sh
+\`\`\`
+
+Berkeley DB 4.8 is already handled by the build and is not installed from apt.
+
+Equivalent apt command:
+\`\`\`bash
+sudo apt-get update -qq
+sudo apt-get install -y -qq ${install_packages}
+\`\`\`
+
+### Run the Qt wallet:
+\`\`\`bash
+./photon-qt
+\`\`\`
+
+### Run the daemon:
+\`\`\`bash
+./photond -daemon
+./photon-cli getinfo
+\`\`\`
+
+## Installation (optional)
+
+### Copy daemon binaries:
+\`\`\`bash
+mkdir -p ~/.local/bin
+cp photond photon-cli photon-tx ~/.local/bin/
+\`\`\`
+
+### Install the Qt wallet:
+\`\`\`bash
+mkdir -p ~/.local/bin
+${qt_copy_block}
+\`\`\`
+
+### Install desktop entry and icon:
+
+This step only adds a Show Apps / application-menu launcher. Copy \`photon-qt\` into \`~/.local/bin/\` first so the desktop entry resolves correctly.
+${qt_desktop_note}
+
+\`\`\`bash
+mkdir -p ~/.local/bin
+mkdir -p ~/.local/share/applications
+mkdir -p ~/.local/share/icons/hicolor/256x256/apps
+${qt_copy_block}
+cp ${COIN_NAME}.desktop ~/.local/share/applications/
+cp ${COIN_NAME}-256.png ~/.local/share/icons/hicolor/256x256/apps/photon-qt.png
+
+# Create index.theme if missing
+if [ ! -f ~/.local/share/icons/hicolor/index.theme ]; then
+    mkdir -p ~/.local/share/icons/hicolor
+    echo -e "[Icon Theme]\\nName=Hicolor\\nComment=Fallback Icon Theme\\nDirectories=256x256/apps\\n\\n[256x256/apps]\\nSize=256\\nContext=Applications\\nType=Fixed" > ~/.local/share/icons/hicolor/index.theme
+fi
+
+gtk-update-icon-cache ~/.local/share/icons/hicolor/ 2>/dev/null || true
+\`\`\`
+
+## Configuration
+
+On first run, a config file will be generated at \`~/.photon/photon.conf\` with random RPC credentials and peer nodes.
+
+- P2P port: 8773
+- RPC port: 8772
+
+## Build Info
+
+Built on Ubuntu ${ubuntu_ver}.
+EOF
+            ;;
+        *)
+            error "Unknown Linux readme target: $target"
+            exit 1
+            ;;
+    esac
+}
+
+cleanup_linux_native_output_root() {
+    local stale_paths=()
+
     mkdir -p "$OUTPUT_BASE"
-    cat > "$conf_path" <<EOF
+
+    rm -f \
+        "$OUTPUT_BASE/$DAEMON_NAME" \
+        "$OUTPUT_BASE/$CLI_NAME" \
+        "$OUTPUT_BASE/$TX_NAME" \
+        "$OUTPUT_BASE/$QT_NAME" \
+        "$OUTPUT_BASE/${QT_NAME}-bin" \
+        "$OUTPUT_BASE/install-deps.sh" \
+        "$OUTPUT_BASE/${COIN_NAME}.desktop" \
+        "$OUTPUT_BASE/${COIN_NAME}-256.png" \
+        "$OUTPUT_BASE/README.md"
+    rm -rf "$OUTPUT_BASE/.runtime" "$OUTPUT_BASE/lib" "$OUTPUT_BASE/plugins"
+    rm -rf "$OUTPUT_BASE/native"
+
+    shopt -s nullglob
+    stale_paths=(
+        "$OUTPUT_BASE"/photon-v${VERSION}-ubuntu-*-x86_64
+        "$OUTPUT_BASE"/photon-v${VERSION}-ubuntu-*-x86_64-daemon
+        "$OUTPUT_BASE"/photon-v${VERSION}-ubuntu-*-x86_64-qt
+        "$OUTPUT_BASE"/photon-v${VERSION}-ubuntu-*-x86_64.tar.gz
+    )
+    shopt -u nullglob
+
+    if [[ ${#stale_paths[@]} -gt 0 ]]; then
+        rm -rf "${stale_paths[@]}"
+    fi
+}
+
+cleanup_windows_native_output_root() {
+    mkdir -p "$OUTPUT_BASE"
+
+    rm -f \
+        "$OUTPUT_BASE/${DAEMON_NAME}.exe" \
+        "$OUTPUT_BASE/${CLI_NAME}.exe" \
+        "$OUTPUT_BASE/${TX_NAME}.exe" \
+        "$OUTPUT_BASE/${QT_NAME}.exe" \
+        "$OUTPUT_BASE/qt.conf" \
+        "$OUTPUT_BASE/build-info.txt"
+    rm -rf \
+        "$OUTPUT_BASE/platforms" \
+        "$OUTPUT_BASE/windows-native"
+
+    shopt -s nullglob
+    local stale_files=(
+        "$OUTPUT_BASE"/*.dll
+        "$OUTPUT_BASE"/${DAEMON_NAME}-${VERSION}.exe
+        "$OUTPUT_BASE"/${CLI_NAME}-${VERSION}.exe
+        "$OUTPUT_BASE"/${TX_NAME}-${VERSION}.exe
+        "$OUTPUT_BASE"/${QT_NAME}-${VERSION}.exe
+    )
+    shopt -u nullglob
+
+    if [[ ${#stale_files[@]} -gt 0 ]]; then
+        rm -f "${stale_files[@]}"
+    fi
+}
+
+cleanup_simple_output_root() {
+    mkdir -p "$OUTPUT_BASE"
+
+    rm -f \
+        "$OUTPUT_BASE/$DAEMON_NAME" \
+        "$OUTPUT_BASE/$CLI_NAME" \
+        "$OUTPUT_BASE/$TX_NAME" \
+        "$OUTPUT_BASE/$QT_NAME" \
+        "$OUTPUT_BASE/${QT_NAME}-bin" \
+        "$OUTPUT_BASE/${DAEMON_NAME}.exe" \
+        "$OUTPUT_BASE/${CLI_NAME}.exe" \
+        "$OUTPUT_BASE/${TX_NAME}.exe" \
+        "$OUTPUT_BASE/${QT_NAME}.exe" \
+        "$OUTPUT_BASE/${DAEMON_NAME}-${VERSION}" \
+        "$OUTPUT_BASE/${CLI_NAME}-${VERSION}" \
+        "$OUTPUT_BASE/${TX_NAME}-${VERSION}" \
+        "$OUTPUT_BASE/${QT_NAME}-${VERSION}" \
+        "$OUTPUT_BASE/${DAEMON_NAME}-${VERSION}.exe" \
+        "$OUTPUT_BASE/${CLI_NAME}-${VERSION}.exe" \
+        "$OUTPUT_BASE/${TX_NAME}-${VERSION}.exe" \
+        "$OUTPUT_BASE/${QT_NAME}-${VERSION}.exe" \
+        "$OUTPUT_BASE/install-deps.sh" \
+        "$OUTPUT_BASE/${COIN_NAME}.desktop" \
+        "$OUTPUT_BASE/${COIN_NAME}-256.png" \
+        "$OUTPUT_BASE/photon.conf" \
+        "$OUTPUT_BASE/qt.conf" \
+        "$OUTPUT_BASE/README.md" \
+        "$OUTPUT_BASE/build-info.txt"
+
+    rm -rf \
+        "$OUTPUT_BASE/.runtime" \
+        "$OUTPUT_BASE/lib" \
+        "$OUTPUT_BASE/plugins" \
+        "$OUTPUT_BASE/platforms" \
+        "$OUTPUT_BASE/Photon-Qt.app" \
+        "$OUTPUT_BASE/native" \
+        "$OUTPUT_BASE/windows" \
+        "$OUTPUT_BASE/macos" \
+        "$OUTPUT_BASE/windows-native" \
+        "$OUTPUT_BASE/macos-native" \
+        "$OUTPUT_BASE/daemon" \
+        "$OUTPUT_BASE/qt"
+
+    shopt -s nullglob
+    local stale_dlls=("$OUTPUT_BASE"/*.dll)
+    shopt -u nullglob
+    if [[ ${#stale_dlls[@]} -gt 0 ]]; then
+        rm -f "${stale_dlls[@]}"
+    fi
+}
+
+normalize_windows_source_timestamps() {
+    [[ -d "$SCRIPT_DIR" ]] || return 0
+
+    info "Normalizing native Windows source timestamps..."
+    find "$SCRIPT_DIR" -type f \
+        -not -path "$SCRIPT_DIR/.git/*" \
+        -not -path "$SCRIPT_DIR/outputs/*" \
+        -exec touch -c {} + 2>/dev/null || true
+}
+
+stage_linux_qt_runtime_bundle() {
+    local qt_source_binary="$1"
+    local package_dir="$2"
+    local stage_dir=""
+
+    [[ -x "$qt_source_binary" ]] || {
+        error "Qt source binary not found: $qt_source_binary"
+        exit 1
+    }
+
+    stage_dir=$(mktemp -d)
+    cp "$qt_source_binary" "$stage_dir/${QT_NAME}-${VERSION}"
+    bundle_linux_qt_runtime "$stage_dir"
+
+    mkdir -p "$package_dir/.runtime"
+    cp -a "$stage_dir/.runtime/." "$package_dir/.runtime/"
+    if [[ -f "$package_dir/.runtime/${QT_NAME}-bin-${VERSION}" ]]; then
+        mv "$package_dir/.runtime/${QT_NAME}-bin-${VERSION}" "$package_dir/.runtime/${QT_NAME}-bin"
+    fi
+
+    rm -f "$package_dir/$QT_NAME"
+    compile_linux_qt_launcher "$package_dir/$QT_NAME"
+    rm -rf "$stage_dir"
+}
+
+install_linux_desktop_launcher() {
+    local qt_bundle_dir="$1"
+    local desktop_dir="$HOME/.local/share/applications"
+    local icon_dir="$HOME/.local/share/icons/hicolor/256x256/apps"
+    local icon_source="$SCRIPT_DIR/src/qt/res/icons/bitcoin.png"
+
+    mkdir -p "$desktop_dir" "$icon_dir"
+    if [[ -f "$icon_source" ]]; then
+        cp "$icon_source" "$icon_dir/${COIN_NAME}.png"
+    fi
+    cat > "$desktop_dir/${QT_NAME}.desktop" <<DEOF
+[Desktop Entry]
+Type=Application
+Name=Photon Qt
+Icon=$icon_dir/${COIN_NAME}.png
+Exec=$qt_bundle_dir/$QT_NAME
+Terminal=false
+Categories=Finance;Network;
+StartupWMClass=${QT_NAME}
+DEOF
+    chmod +x "$desktop_dir/${QT_NAME}.desktop"
+    info "Desktop launcher installed  -  Photon Qt will appear in Activities search"
+}
+
+detect_native_docker_ubuntu_version() {
+    local version=""
+
+    case "$DOCKER_NATIVE" in
+        *native-base:20.04*) version="20.04" ;;
+        *native-base:22.04*) version="22.04" ;;
+        *native-base:24.04*) version="24.04" ;;
+        *native-base:25.10*) version="25.10" ;;
+    esac
+
+    if [[ -n "$version" ]]; then
+        printf '%s\n' "$version"
+        return 0
+    fi
+
+    docker run --rm "$DOCKER_NATIVE" /bin/bash -lc '. /etc/os-release >/dev/null 2>&1 && printf "%s\n" "$VERSION_ID"' 2>/dev/null || true
+}
+
+write_appimage_bundle_readme() {
+    local readme_path="$1"
+
+    cat > "$readme_path" <<EOF
+# Photon v${VERSION} - Linux AppImage
+
+## Contents
+
+- ${APPIMAGE_PUBLIC_NAME}
+- README.md
+- build-info.txt
+
+## Quick Start
+
+Make the AppImage executable and run it:
+
+\`\`\`bash
+chmod +x ${APPIMAGE_PUBLIC_NAME}
+./${APPIMAGE_PUBLIC_NAME}
+\`\`\`
+
+## Ubuntu Direct Launch Requirements
+
+- Ubuntu 22.04.5: \`sudo apt install libfuse2\`
+- Ubuntu 24.04.4: \`sudo apt install libfuse2t64\`
+- Ubuntu 25.10: \`sudo apt install libfuse2t64\`
+
+If the host is missing that package, direct AppImage startup fails with:
+
+\`\`\`text
+dlopen(): error loading libfuse.so.2
+\`\`\`
+
+## Fallback Launch
+
+\`\`\`bash
+./${APPIMAGE_PUBLIC_NAME} --appimage-extract-and-run
+\`\`\`
+
+## Notes
+
+- This AppImage is intended for Ubuntu 22.04 and newer.
+- Ubuntu 20.04 users should use the native Ubuntu 20.04 build in \`outputs/\`.
+EOF
+}
+
+finalize_linux_native_output() {
+    local ubuntu_ver="$1"
+    local target="$2"
+    local daemon_source="$3"
+    local cli_source="$4"
+    local tx_source="$5"
+    local qt_source_binary="$6"
+    local install_packages="${7:-}"
+    local output_dir=""
+    local icon_source="$SCRIPT_DIR/src/qt/res/icons/bitcoin.png"
+
+    ubuntu_ver="${ubuntu_ver:-unknown}"
+    output_dir="$(linux_output_dir "$ubuntu_ver")"
+
+    case "$target" in
+        daemon|both)
+            for source_file in "$daemon_source" "$cli_source" "$tx_source"; do
+                [[ -x "$source_file" ]] || {
+                    error "Missing Linux daemon artifact: $source_file"
+                    exit 1
+                }
+            done
+            ;;
+    esac
+
+    case "$target" in
+        qt|both)
+            [[ -x "$qt_source_binary" ]] || {
+                error "Missing Linux Qt artifact: $qt_source_binary"
+                exit 1
+            }
+            ;;
+    esac
+
+    cleanup_legacy_output_root
+    cleanup_target_output_dir "$output_dir"
+
+    if [[ "$target" == "daemon" || "$target" == "both" ]]; then
+        cp "$daemon_source" "$output_dir/$DAEMON_NAME"
+        cp "$cli_source" "$output_dir/$CLI_NAME"
+        cp "$tx_source" "$output_dir/$TX_NAME"
+    fi
+
+    if [[ "$target" == "qt" || "$target" == "both" ]]; then
+        if [[ "$ubuntu_ver" == 20.04* ]]; then
+            cp "$qt_source_binary" "$output_dir/${QT_NAME}-bin"
+            compile_linux_qt_launcher "$output_dir/$QT_NAME" "${QT_NAME}-bin" 0
+        else
+            cp "$qt_source_binary" "$output_dir/$QT_NAME"
+        fi
+
+        if [[ -f "$icon_source" ]]; then
+            cp "$icon_source" "$output_dir/${COIN_NAME}-256.png"
+        else
+            warn "Release icon source not found: $icon_source"
+        fi
+
+        write_linux_release_desktop "$output_dir/${COIN_NAME}.desktop"
+    fi
+
+    write_linux_install_deps_script "$output_dir/install-deps.sh" "$install_packages"
+    write_linux_release_readme "$output_dir/README.md" "$ubuntu_ver" "$target" "$install_packages"
+    CURRENT_OUTPUT_DIR="$output_dir"
+    GENERATE_CONFIG_AFTER_BUILD=1
+
+    success "Linux output files updated in: $output_dir"
+}
+
+bundle_linux_qt_runtime() {
+    local qt_output_dir="$1"
+    local launcher_path="$qt_output_dir/${QT_NAME}-${VERSION}"
+    local runtime_dir="$qt_output_dir/.runtime"
+    local binary_path="$runtime_dir/${QT_NAME}-bin-${VERSION}"
+    local lib_dir="$runtime_dir/lib"
+    local plugin_dir="$runtime_dir/plugins/platforms"
+    local qt_plugin_root=""
+
+    [[ -f "$launcher_path" ]] || return 0
+
+    rm -rf "$runtime_dir"
+    mkdir -p "$lib_dir" "$plugin_dir"
+    mv "$launcher_path" "$binary_path"
+
+    copy_runtime_libs "$binary_path" "$lib_dir"
+
+    if command -v qtpaths >/dev/null 2>&1; then
+        qt_plugin_root=$(qtpaths --plugin-dir 2>/dev/null || true)
+    fi
+    if [[ -z "$qt_plugin_root" ]] && command -v qmake >/dev/null 2>&1; then
+        qt_plugin_root=$(qmake -query QT_INSTALL_PLUGINS 2>/dev/null || true)
+    fi
+    if [[ -z "$qt_plugin_root" ]] && [[ -d /usr/lib/x86_64-linux-gnu/qt5/plugins ]]; then
+        qt_plugin_root="/usr/lib/x86_64-linux-gnu/qt5/plugins"
+    fi
+
+    if [[ -n "$qt_plugin_root" && -f "$qt_plugin_root/platforms/libqxcb.so" ]]; then
+        cp -Lf "$qt_plugin_root/platforms/libqxcb.so" "$plugin_dir/"
+        copy_runtime_libs "$plugin_dir/libqxcb.so" "$lib_dir"
+    else
+        warn "Qt platform plugin libqxcb.so not found; bundled launcher may still rely on system Qt plugins"
+    fi
+
+    cat > "$launcher_path" <<EOF
+#!/bin/sh
+set -e
+APPDIR=\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd)
+export LD_LIBRARY_PATH="\$APPDIR/.runtime/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+export QT_PLUGIN_PATH="\$APPDIR/.runtime/plugins\${QT_PLUGIN_PATH:+:\$QT_PLUGIN_PATH}"
+export QT_QPA_PLATFORM_PLUGIN_PATH="\$APPDIR/.runtime/plugins/platforms"
+exec "\$APPDIR/.runtime/${QT_NAME}-bin-${VERSION}" "\$@"
+EOF
+    chmod +x "$launcher_path"
+    info "Bundled Qt runtime libraries into $qt_output_dir/"
+}
+
+generate_config() {
+    local output_dir="${1:-$OUTPUT_BASE}"
+    local conf_path="$output_dir/$CONFIG_FILE"
+    local data_dir="$HOME/.${COIN_NAME}"
+    local data_conf_path="$data_dir/$CONFIG_FILE"
+    local rpcuser rpcpassword peers=""
+    local peers_json=""
+    local tmp_conf=""
+    local host_os=""
+    local daemon_line="$DAEMON"
+
+    fetch_explorer_addnodes() {
+        if ! command -v curl &>/dev/null; then
+            return 0
+        fi
+
+        peers_json=$(curl -fsSL --connect-timeout 5 --max-time 15 \
+            "${EXPLORER_API_BASE%/}/${EXPLORER_COIN_ID}/globe/peers" 2>/dev/null || true)
+
+        if [[ -n "$peers_json" ]]; then
+            printf '%s\n' "$peers_json" \
+                | grep -oE '"addr"[[:space:]]*:[[:space:]]*"([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]+)?"' \
+                | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+                | awk -F. '
+                    $1 >= 0 && $1 <= 255 &&
+                    $2 >= 0 && $2 <= 255 &&
+                    $3 >= 0 && $3 <= 255 &&
+                    $4 >= 0 && $4 <= 255 &&
+                    $1 != 0 &&
+                    $1 != 10 &&
+                    $1 != 127 &&
+                    !($1 == 169 && $2 == 254) &&
+                    !($1 == 172 && $2 >= 16 && $2 <= 31) &&
+                    !($1 == 192 && $2 == 168) &&
+                    !($1 == 100 && $2 >= 64 && $2 <= 127) &&
+                    $1 < 224
+                ' \
+                | sort -u \
+                | sed 's/^/addnode=/'
+        fi
+    }
+
+    mkdir -p "$output_dir" "$data_dir"
+    host_os="$(detect_os)"
+    if [[ "$host_os" == "windows" ]]; then
+        daemon_line=""
+    fi
+    peers="$(fetch_explorer_addnodes || true)"
+
+    if [[ -f "$data_conf_path" ]]; then
+        info "Refreshing active peer addnode entries in $data_conf_path"
+        tmp_conf=$(mktemp)
+        if [[ "$host_os" == "windows" ]]; then
+            sed '/^addnode=/d;/^daemon=/d' "$data_conf_path" > "$tmp_conf"
+        else
+            sed '/^addnode=/d' "$data_conf_path" > "$tmp_conf"
+        fi
+        if [[ -n "$peers" ]]; then
+            printf '%s\n' "$peers" >> "$tmp_conf"
+        else
+            warn "Explorer returned no usable peers; leaving config without addnode entries"
+        fi
+        mv "$tmp_conf" "$data_conf_path"
+        tmp_conf=""
+    else
+        info "Generating $CONFIG_FILE..."
+        rpcuser="rpcuser=$(LC_ALL=C head -c 100 /dev/urandom | LC_ALL=C tr -cd '[:alnum:]' | head -c 10)"
+        rpcpassword="rpcpassword=$(LC_ALL=C head -c 200 /dev/urandom | LC_ALL=C tr -cd '[:alnum:]' | head -c 22)"
+        cat > "$data_conf_path" <<EOF
 maxconnections=20
 $rpcuser
 $rpcpassword
@@ -226,901 +1620,935 @@ rpcallowip=0.0.0.0/0
 rpcport=$RPC_PORT
 port=$P2P_PORT
 gen=0
-listen=1
-daemon=1
-server=1
-txindex=0
-$upnp_line
+$LISTEN
+$daemon_line
+$SERVER
+$TXINDEX
 $peers
 EOF
-    success "Config written: $conf_path"
-
-    # Install config to platform data directory if running natively
-    local data_dir=""
-    case "$(uname -s)" in
-        Darwin)  data_dir="$HOME/Library/Application Support/$COIN_NAME_UPPER" ;;
-        Linux)   data_dir="$HOME/$CONFIG_DIR" ;;
-        MINGW*|MSYS*) data_dir="${APPDATA:-}/$COIN_NAME_UPPER" ;;
-    esac
-    if [[ -n "$data_dir" && ! -f "$data_dir/$CONFIG_FILE" ]]; then
-        mkdir -p "$data_dir"
-        cp "$conf_path" "$data_dir/$CONFIG_FILE"
-        info "Config installed: $data_dir/$CONFIG_FILE"
+        if [[ -z "$peers" ]]; then
+            warn "Explorer returned no usable peers; created config without addnode entries"
+        fi
     fi
+
+    cp "$data_conf_path" "$conf_path"
+    success "Config written: $conf_path"
+    info "Config installed to $data_conf_path"
 }
 
 ensure_docker_image() {
     local image="$1"
     local docker_mode="$2"
-    local dockerfile="$SCRIPT_DIR/docker/${3:-}"
 
-    if [[ "$docker_mode" == "pull" ]]; then
+    if [[ "$docker_mode" == "build" ]]; then
+        # Use cached image if it exists, otherwise build from local Dockerfiles
         if docker image inspect "$image" >/dev/null 2>&1; then
-            info "Image $image found locally."
-        else
-            info "Pulling $image from Docker Hub..."
-            if docker pull "$image"; then
-                success "Pulled $image"
+            info "Image $image found locally (built)."
+            return 0
+        fi
+        local docker_dir="$SCRIPT_DIR/docker"
+        local dockerfile=""
+        case "$image" in
+            *native-base:20.04*)  dockerfile="Dockerfile.native-base-20.04" ;;
+            *native-base:22.04*)  dockerfile="Dockerfile.native-base-22.04" ;;
+            *native-base:24.04*)  dockerfile="Dockerfile.native-base-24.04" ;;
+            *native-base:25.10*)  dockerfile="Dockerfile.native-base-25.10" ;;
+            *native-base*)        dockerfile="Dockerfile.native-base-22.04" ;;
+            *appimage-base*)      dockerfile="Dockerfile.appimage-base" ;;
+            *mxe-base*)           dockerfile="Dockerfile.mxe-base" ;;
+            *osxcross-base*)      dockerfile="Dockerfile.osxcross-base" ;;
+            *)
+                error "Unknown image: $image"
+                exit 1
+                ;;
+        esac
+        if [[ -f "$docker_dir/$dockerfile" ]]; then
+            info "Building $image from $dockerfile..."
+            if docker build -t "$image" -f "$docker_dir/$dockerfile" "$docker_dir/"; then
+                success "Built $image"
             else
-                error "Failed to pull $image"
-                error "Try --build-docker to build locally, or check https://hub.docker.com/r/${image%%:*}"
+                error "Failed to build $image from $dockerfile"
                 exit 1
             fi
-        fi
-    elif [[ "$docker_mode" == "build" ]]; then
-        if [[ ! -f "$dockerfile" ]]; then
-            error "Dockerfile not found: $dockerfile"
-            error "Expected Dockerfiles in docker/ directory. See docker/README.md"
+        else
+            error "Dockerfile not found: $docker_dir/$dockerfile"
+            error "Ensure docker/ directory contains the Dockerfiles."
             exit 1
         fi
-        info "Building $image locally from $(basename "$dockerfile")..."
-        info "This may take a while on first build (Docker caches subsequent builds)."
-        if docker build -t "$image" -f "$dockerfile" "$(dirname "$dockerfile")"; then
-            success "Built $image"
+        return 0
+    fi
+
+    # Pull mode  -  check local cache first
+    if docker image inspect "$image" >/dev/null 2>&1; then
+        info "Image $image found locally."
+        return 0
+    fi
+
+    if [[ "$docker_mode" == "pull" ]]; then
+        info "Pulling $image from Docker Hub..."
+        if docker pull "$image"; then
+            success "Pulled $image"
         else
-            error "Failed to build $image from $dockerfile"
+            error "Failed to pull $image"
+            error "Check https://hub.docker.com/r/${image%%:*}"
+            error "Or use --build-docker to build from local Dockerfiles."
             exit 1
         fi
     else
         error "Docker is required for this build. Use --pull-docker or --build-docker"
         error "  --pull-docker   Pull prebuilt image from Docker Hub"
-        error "  --build-docker  Build image locally from repo Dockerfiles"
+        error "  --build-docker  Build image locally from Dockerfiles in docker/"
         exit 1
     fi
 }
 
 # =============================================================================
-# COMMON PATCHES — applied to .pro file for all qmake builds
-# =============================================================================
-
-apply_pro_patches() {
-    local pro_file="$1"
-    local dep_prefix="${2:-}"  # e.g. /opt/compat, Homebrew prefix, or empty for system
-
-    info "Patching .pro file: $pro_file"
-
-    # Fix qmake conditional syntax: USE_UPNP:=1 -> USE_UPNP=1
-    # Why: qmake uses = not := for variable assignment
-    sedi "s/USE_UPNP:=1/USE_UPNP=1/" "$pro_file"
-
-    # Fix lrelease path: \\lrelease.exe -> /lrelease
-    # Why: Windows-specific path separator doesn't work on other platforms
-    sedi 's|\\\\\\\\lrelease.exe|/lrelease|' "$pro_file"
-
-    # Remove hardcoded boost lib suffix
-    # Why: Suffix like -mgw54-mt-s-x32-1_71 is MinGW-specific; doesn't match installed Boost
-    sedi 's/BOOST_LIB_SUFFIX=-mgw[^ ]*/BOOST_LIB_SUFFIX=/' "$pro_file"
-
-    # Comment out isEmpty(BOOST_LIB_SUFFIX) auto-detection block
-    # Why: Auto-detection tries Windows-style suffixes; we use unsuffixed Boost libs
-    sedi '/isEmpty(BOOST_LIB_SUFFIX)/,/^}/s/^/# /' "$pro_file"
-
-    # Remove hardcoded boost lib references with version-specific names
-    # Why: These reference Windows MinGW Boost builds that don't exist on other platforms
-    sedi '/-lboost_system-mgw[^ ]*/d' "$pro_file"
-
-    # Add BOOST_BIND_GLOBAL_PLACEHOLDERS to suppress Boost.Bind deprecation warnings
-    # Why: Boost 1.73+ deprecated global placeholders (_1, _2); this define suppresses the warning
-    if ! grep -q 'BOOST_BIND_GLOBAL_PLACEHOLDERS' "$pro_file"; then
-        sedi '/^DEFINES/s/$/ BOOST_BIND_GLOBAL_PLACEHOLDERS/' "$pro_file"
-    fi
-
-    # Replace dependency paths if a prefix is provided
-    if [[ -n "$dep_prefix" ]]; then
-        sedi "s|BOOST_INCLUDE_PATH=.*|BOOST_INCLUDE_PATH=$dep_prefix/include|" "$pro_file"
-        sedi "s|BOOST_LIB_PATH=.*|BOOST_LIB_PATH=$dep_prefix/lib|" "$pro_file"
-        sedi "s|BDB_INCLUDE_PATH=.*|BDB_INCLUDE_PATH=$dep_prefix/include|" "$pro_file"
-        sedi "s|BDB_LIB_PATH=.*|BDB_LIB_PATH=$dep_prefix/lib|" "$pro_file"
-        sedi "s|OPENSSL_INCLUDE_PATH=.*|OPENSSL_INCLUDE_PATH=$dep_prefix/include|" "$pro_file"
-        sedi "s|OPENSSL_LIB_PATH=.*|OPENSSL_LIB_PATH=$dep_prefix/lib|" "$pro_file"
-        sedi "s|MINIUPNPC_INCLUDE_PATH=.*|MINIUPNPC_INCLUDE_PATH=$dep_prefix/include|" "$pro_file"
-        sedi "s|MINIUPNPC_LIB_PATH=.*|MINIUPNPC_LIB_PATH=$dep_prefix/lib|" "$pro_file"
-    fi
-}
-
-# =============================================================================
-# WINDOWS CROSS-COMPILE (Docker + MXE)
+# WINDOWS CROSS-COMPILE (Docker + MXE + autotools)
+# Uses pre-built libs in mxe-base image  -  skips depends/ entirely
 # =============================================================================
 
 build_windows() {
-    local target="$1"  # daemon, qt, or both
+    local target="$1"
     local jobs="$2"
     local docker_mode="$3"
-    local container_name="win-${COIN_NAME}-build"
-    local output_dir="$OUTPUT_BASE/windows"
+    local container_name="win-${COIN_NAME}-0152-build"
+    local output_dir=""
 
     echo ""
     echo "============================================"
-    echo "  Windows Cross-Compile: $COIN_NAME_UPPER"
+    echo "  Windows Cross-Compile: $COIN_NAME_UPPER $VERSION"
     echo "============================================"
-    echo "  Image:  $DOCKER_WINDOWS"
-    echo "  Target: $target"
+    echo "  Image:    $DOCKER_WINDOWS"
+    echo "  Strategy: MXE + autotools (pre-built libs)"
     echo ""
 
-    ensure_docker_image "$DOCKER_WINDOWS" "$docker_mode" "Dockerfile.mxe-base"
-    mkdir -p "$output_dir/qt" "$output_dir/daemon"
+    output_dir="$(windows_output_dir)"
+    ensure_windows_icon_assets
+    ensure_docker_image "$DOCKER_WINDOWS" "$docker_mode"
+    cleanup_legacy_output_root
+    cleanup_target_output_dir "$output_dir"
     docker rm -f "$container_name" 2>/dev/null || true
 
-    if [[ "$target" == "qt" || "$target" == "both" ]]; then
-        info "Building Qt wallet for Windows..."
+    # Copy source to temp dir for volume-mount
+    info "Copying source tree to temp build dir..."
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    copy_source_tree_to_tempdir "$tmpdir"
+    clean_stale_build_artifacts "$tmpdir"
+    fix_permissions "$tmpdir"
 
-        docker create \
-            --name "$container_name" \
-            "$DOCKER_WINDOWS" \
-            /bin/bash -c '
+    # Build configure flags based on target
+    local configure_extra=""
+    case "$target" in
+        daemon) configure_extra="--without-gui" ;;
+        qt)     configure_extra="--with-gui=qt5" ;;
+        both)   configure_extra="--with-gui=qt5" ;;
+    esac
+
+    docker create \
+        --name "$container_name" \
+        -v "$tmpdir:/build/$COIN_NAME:rw" \
+        "$DOCKER_WINDOWS" \
+        /bin/bash -c '
 set -e
-
-# Add MXE Qt5 tools to PATH (lrelease needed for translation files)
-export PATH="/opt/mxe/usr/x86_64-w64-mingw32.static/qt5/bin:$PATH"
-
-# Fix miniupnpc: remove upnpc.c.obj (contains main()) which overrides wallet main()
-# Why: miniupnpc ships a demo program with its own main(); conflicts with wallet binary
-x86_64-w64-mingw32.static-ar d '"$MXE_SYSROOT"'/lib/libminiupnpc.a upnpc.c.obj 2>/dev/null || true
-
-echo ">>> Cloning from '"$REPO_URL"'..."
-git clone --depth 1 -b '"$REPO_BRANCH"' '"$REPO_URL"' /build/'"$COIN_NAME"'
 cd /build/'"$COIN_NAME"'
 
-echo ">>> Patching .pro file..."
+# MXE cross-compiler setup
+export PATH=/opt/mxe/usr/bin:$PATH
+HOST='"$WIN_HOST"'
+MXE_SYSROOT=/opt/mxe/usr/${HOST}
+export PATH="${MXE_SYSROOT}/qt5/bin:$PATH"
 
-# Fix .rc icon references for Windows resource compiler (case-sensitive on Linux)
-# Approach from tested lib/windows.sh: only lowercase if lowercase file exists
-if [ -f src/qt/res/bitcoin-qt.rc ]; then
-    for ico_ref in $(grep -oP "\"icons/[^\"]+\\.ico\"" src/qt/res/bitcoin-qt.rc | tr -d "\""); do
-        ico_lower=$(echo "$ico_ref" | tr "[:upper:]" "[:lower:]")
-        if [ "$ico_ref" != "$ico_lower" ] && [ -f "src/qt/res/$ico_lower" ]; then
-            sed -i "s|$ico_ref|$ico_lower|g" src/qt/res/bitcoin-qt.rc
-        fi
-    done
+# Set pkg-config to find MXE target libraries (Qt5, libevent, protobuf)
+export PKG_CONFIG_LIBDIR="${MXE_SYSROOT}/qt5/lib/pkgconfig:${MXE_SYSROOT}/lib/pkgconfig"
+
+echo ">>> MXE environment:"
+echo "    HOST=$HOST"
+echo "    MXE_SYSROOT=$MXE_SYSROOT"
+echo "    PKG_CONFIG_LIBDIR=$PKG_CONFIG_LIBDIR"
+echo "    Compat libs: /opt/compat/"
+which ${HOST}-gcc || { echo "ERROR: Cross-compiler not found"; exit 1; }
+
+# Restore MXE OpenSSL 3.x (Qt5 was compiled against it; compat has 1.1.1 which is incompatible)
+echo ">>> Restoring MXE OpenSSL 3.x for Qt5 compatibility..."
+rm -f /opt/compat/lib/libssl.a /opt/compat/lib/libcrypto.a
+if [ -d ${MXE_SYSROOT}/include/openssl.mxe.bak ]; then
+    rm -rf ${MXE_SYSROOT}/include/openssl
+    cp -r ${MXE_SYSROOT}/include/openssl.mxe.bak ${MXE_SYSROOT}/include/openssl
 fi
+cp ${MXE_SYSROOT}/lib/mxe_bak/libssl.a ${MXE_SYSROOT}/lib/libssl.a
+cp ${MXE_SYSROOT}/lib/mxe_bak/libcrypto.a ${MXE_SYSROOT}/lib/libcrypto.a
 
-# Fix GCC uninitialized warning treated as error in MXE cross-compile
-sed -i "s|QMAKE_CXXFLAGS_WARN_ON = .*|QMAKE_CXXFLAGS_WARN_ON = -fdiagnostics-show-option -Wall -Wextra -Wformat -Wformat-security -Wno-unused-parameter -Wno-maybe-uninitialized -Wstack-protector|" *.pro
+# Verify Qt5 is findable
+pkg-config --cflags Qt5Core 2>/dev/null && echo ">>> Qt5Core found via pkg-config" || echo "WARNING: Qt5Core not found"
 
-# Fix qmake conditional syntax: USE_UPNP:=1 -> USE_UPNP=1
-sed -i "s/USE_UPNP:=1/USE_UPNP=1/" *.pro
-
-# Fix lrelease path: replace any \\lrelease.exe or broken lrelease references
-# Why: upstream .pro uses Windows path \\lrelease.exe which fails on Linux cross-compile
-LRELEASE_BIN=$(find /opt/mxe -name "lrelease" -type f 2>/dev/null | head -1)
-[ -z "$LRELEASE_BIN" ] && LRELEASE_BIN="lrelease"
-sed -i "s|QMAKE_LRELEASE = .*|QMAKE_LRELEASE = $LRELEASE_BIN|" *.pro
-# Also fix the system() call that runs lrelease during qmake
-sed -i "s|system(.*QMAKE_LRELEASE.*)|# lrelease handled by Makefile rules|" *.pro
-
-# Replace hardcoded C:/deps paths with /opt/compat
-sed -i "s|BOOST_INCLUDE_PATH=.*|BOOST_INCLUDE_PATH=/opt/compat/include|" *.pro
-sed -i "s|BOOST_LIB_PATH=.*|BOOST_LIB_PATH=/opt/compat/lib|" *.pro
-sed -i "s|BDB_INCLUDE_PATH=.*|BDB_INCLUDE_PATH=/opt/compat/include|" *.pro
-sed -i "s|BDB_LIB_PATH=.*|BDB_LIB_PATH=/opt/compat/lib|" *.pro
-sed -i "s|OPENSSL_INCLUDE_PATH=.*|OPENSSL_INCLUDE_PATH=/opt/compat/include|" *.pro
-sed -i "s|OPENSSL_LIB_PATH=.*|OPENSSL_LIB_PATH=/opt/compat/lib|" *.pro
-
-# Point miniupnpc at MXE sysroot
-sed -i "s|MINIUPNPC_INCLUDE_PATH=.*|MINIUPNPC_INCLUDE_PATH='"$MXE_SYSROOT"'/include|" *.pro
-sed -i "s|MINIUPNPC_LIB_PATH=.*|MINIUPNPC_LIB_PATH='"$MXE_SYSROOT"'/lib|" *.pro
-
-# Remove hardcoded boost lib suffix
-# Why: Suffix like -mgw54-mt-s-x32-1_71 doesnt match our Boost build
-sed -i "s/BOOST_LIB_SUFFIX=-mgw54-mt-s-x32-1_71/BOOST_LIB_SUFFIX=/" *.pro
-
-# Comment out isEmpty(BOOST_LIB_SUFFIX) auto-detection block
-sed -i "/isEmpty(BOOST_LIB_SUFFIX)/,/^}/s/^/# /" *.pro
-
-# Remove hardcoded boost lib references
-sed -i "/-lboost_system-mgw54-mt-s-x32-1_71/d" *.pro
-
-# Add BOOST_BIND_GLOBAL_PLACEHOLDERS
-# Why: Boost 1.73+ deprecated global placeholders; suppresses warnings
-sed -i "/^DEFINES/s/$/ BOOST_BIND_GLOBAL_PLACEHOLDERS/" *.pro
-
-echo ">>> Patching source files..."
-
-# Fix pid_t redefinition
-# Why: mingw-w64 already provides pid_t; redefining it causes compile error
-sed -i "s|typedef int pid_t;|// pid_t provided by mingw-w64|" src/util.h
-
-# Fix SOCKET typedef — only define on non-Windows
-# Why: mingw-w64 provides SOCKET; redefining it causes compile error
-sed -i "s|typedef u_int SOCKET;|#ifndef WIN32\ntypedef u_int SOCKET;\n#endif|" src/compat.h
-
-# Add missing boost/bind.hpp includes
-# Why: Boost 1.81+ requires explicit include for boost::bind
-sed -i "/^#include \"clientmodel.h\"/a #include <boost/bind.hpp>" src/qt/clientmodel.cpp
-sed -i "/^#include \"walletmodel.h\"/a #include <boost/bind.hpp>" src/qt/walletmodel.cpp
-
-echo ">>> Writing LevelDB build_config.mk..."
-
-# Why: LevelDB build_detect_platform doesnt work for cross-compilation; manual config needed
-cat > src/leveldb/build_config.mk << '\''LEVELDB_EOF'\''
-SOURCES=db/builder.cc db/c.cc db/db_impl.cc db/db_iter.cc db/dbformat.cc db/filename.cc db/log_reader.cc db/log_writer.cc db/memtable.cc db/repair.cc db/table_cache.cc db/version_edit.cc db/version_set.cc db/write_batch.cc table/block.cc table/block_builder.cc table/filter_block.cc table/format.cc table/iterator.cc table/merger.cc table/table.cc table/table_builder.cc table/two_level_iterator.cc util/arena.cc util/bloom.cc util/cache.cc util/coding.cc util/comparator.cc util/crc32c.cc util/env.cc util/env_win.cc util/filter_policy.cc util/hash.cc util/histogram.cc util/logging.cc util/options.cc util/status.cc port/port_win.cc
-MEMENV_SOURCES=helpers/memenv/memenv.cc
-CC=x86_64-w64-mingw32.static-gcc
-CXX=x86_64-w64-mingw32.static-g++
-PLATFORM=OS_WINDOWS
-PLATFORM_LDFLAGS=-lshlwapi
-PLATFORM_LIBS=
-PLATFORM_CCFLAGS= -fno-builtin-memcmp -D_REENTRANT -DOS_WIN -DLEVELDB_PLATFORM_WINDOWS -DWINVER=0x0500 -D__USE_MINGW_ANSI_STDIO=1 -DLEVELDB_IS_BIG_ENDIAN=0
-PLATFORM_CXXFLAGS= -fno-builtin-memcmp -D_REENTRANT -DOS_WIN -DLEVELDB_PLATFORM_WINDOWS -DWINVER=0x0500 -D__USE_MINGW_ANSI_STDIO=1 -DLEVELDB_IS_BIG_ENDIAN=0
-LEVELDB_EOF
-
-echo ">>> Running qmake..."
-x86_64-w64-mingw32.static-qmake-qt5 *.pro \
-    "USE_UPNP=1" \
-    "USE_QRCODE=0" \
-    "RELEASE=1"
-
-echo ">>> Building with make..."
-make -j'"$jobs"'
-
-echo ">>> Stripping binary..."
-x86_64-w64-mingw32.static-strip release/*.exe 2>/dev/null || x86_64-w64-mingw32.static-strip *.exe 2>/dev/null || true
-
-echo ">>> Build complete!"
-ls -lh release/ 2>/dev/null || ls -lh *.exe 2>/dev/null || true
-'
-
-        info "Starting build container: $container_name"
-        docker start -a "$container_name"
-
-        info "Extracting ${QT_NAME}.exe..."
-        if docker cp "$container_name:/build/$COIN_NAME/release/${QT_NAME}.exe" "$output_dir/qt/${QT_NAME}.exe" 2>/dev/null ||
-           docker cp "$container_name:/build/$COIN_NAME/release/${COIN_NAME_UPPER}-qt.exe" "$output_dir/qt/${QT_NAME}.exe" 2>/dev/null ||
-           docker cp "$container_name:/build/$COIN_NAME/${QT_NAME}.exe" "$output_dir/qt/${QT_NAME}.exe" 2>/dev/null ||
-           docker cp "$container_name:/build/$COIN_NAME/${COIN_NAME_UPPER}-qt.exe" "$output_dir/qt/${QT_NAME}.exe" 2>/dev/null; then
-            success "Qt wallet extracted to $output_dir/qt/"
-            ls -lh "$output_dir/qt/${QT_NAME}.exe"
-        else
-            error "Could not find built .exe in container"
-            docker exec "$container_name" find /build/$COIN_NAME -name "*.exe" -type f 2>/dev/null || true
-            docker rm -f "$container_name" 2>/dev/null || true
-            exit 1
-        fi
-
-        write_build_info "$output_dir/qt" "windows-cross-compile" "qt" "Docker: $DOCKER_WINDOWS (MXE)"
-        docker rm -f "$container_name" 2>/dev/null || true
-    fi
-
-    if [[ "$target" == "daemon" || "$target" == "both" ]]; then
-        info "Building daemon for Windows..."
-        local daemon_container="win-${COIN_NAME}-daemon"
-        docker rm -f "$daemon_container" 2>/dev/null || true
-
-        docker create \
-            --name "$daemon_container" \
-            "$DOCKER_WINDOWS" \
-            /bin/bash -c '
-set -e
-
-export PATH="/opt/mxe/usr/bin:$PATH"
-MXE_TARGET="x86_64-w64-mingw32.static"
-
-# Fix miniupnpc: remove upnpc.c.obj (contains main())
-${MXE_TARGET}-ar d '"$MXE_SYSROOT"'/lib/libminiupnpc.a upnpc.c.obj 2>/dev/null || true
-
-echo ">>> Cloning from '"$REPO_URL"'..."
-git clone --depth 1 -b '"$REPO_BRANCH"' '"$REPO_URL"' /build/'"$COIN_NAME"'
-cd /build/'"$COIN_NAME"'
-
-echo ">>> Patching source files..."
-
-# Fix pid_t redefinition (mingw-w64 provides it)
-sed -i "s|typedef int pid_t;|// pid_t provided by mingw-w64|" src/util.h
-
-# Fix SOCKET typedef — only define on non-Windows
-sed -i "s|typedef u_int SOCKET;|#ifndef WIN32\ntypedef u_int SOCKET;\n#endif|" src/compat.h
-
-# Add missing boost/bind.hpp includes
-for f in src/qt/clientmodel.cpp src/qt/walletmodel.cpp; do
-    if [ -f "$f" ] && ! grep -q "boost/bind.hpp" "$f"; then
-        sed -i "1a #include <boost/bind.hpp>" "$f"
-    fi
+# Patch sources for Qt 5.15+ and Boost 1.73+ compatibility
+echo ">>> Patching sources..."
+if [ -f src/qt/trafficgraphwidget.cpp ]; then
+    grep -q "#include <QPainterPath>" src/qt/trafficgraphwidget.cpp || \
+        sed -i "1i #include <QPainterPath>" src/qt/trafficgraphwidget.cpp
+fi
+for f in $(grep -rl "boost::bind" src/ 2>/dev/null | grep "\.cpp$"); do
+    grep -q "boost/bind.hpp" "$f" || \
+        sed -i "1i #include <boost/bind.hpp>" "$f"
 done
 
-# Fix Boost.Asio get_io_service() removed in Boost 1.70+
-if grep -q "get_io_service" src/bitcoinrpc.cpp 2>/dev/null; then
-    sed -i "s|resolver(stream\.get_io_service())|resolver((boost::asio::io_context\&)stream.get_executor().context())|g" src/bitcoinrpc.cpp
-    sed -i "s|acceptor->get_io_service()|((boost::asio::io_context\&)acceptor->get_executor().context())|g" src/bitcoinrpc.cpp
+# Build Qt5 include flags (all module subdirs)
+QT5INC="${MXE_SYSROOT}/qt5/include"
+QT5_CPPFLAGS="-I${QT5INC}"
+for qtmod in QtCore QtGui QtWidgets QtNetwork QtDBus; do
+    [ -d "${QT5INC}/${qtmod}" ] && QT5_CPPFLAGS="${QT5_CPPFLAGS} -I${QT5INC}/${qtmod}"
+done
+echo ">>> Qt5 include flags: $QT5_CPPFLAGS"
+
+# Create Qt5PlatformSupport merged lib (split into multiple libs in Qt 5.14+)
+QT5LIBDIR="${MXE_SYSROOT}/qt5/lib"
+if [ ! -f "${QT5LIBDIR}/libQt5PlatformSupport.a" ]; then
+    echo ">>> Creating merged Qt5PlatformSupport.a from split modules..."
+    _qt5ps_save_dir=$(pwd)
+    mkdir -p /tmp/qt5ps && cd /tmp/qt5ps
+    for lib in EventDispatcherSupport FontDatabaseSupport ThemeSupport AccessibilitySupport WindowsUIAutomationSupport; do
+        [ -f "${QT5LIBDIR}/libQt5${lib}.a" ] && ar x "${QT5LIBDIR}/libQt5${lib}.a"
+    done
+    ar crs "${QT5LIBDIR}/libQt5PlatformSupport.a" *.o 2>/dev/null || ar crs "${QT5LIBDIR}/libQt5PlatformSupport.a"
+    cd "$_qt5ps_save_dir" && rm -rf /tmp/qt5ps
+    cat > "${QT5LIBDIR}/pkgconfig/Qt5PlatformSupport.pc" <<PCEOF
+Name: Qt5PlatformSupport
+Description: Merged compat lib for Qt 5.14+ (split into separate modules)
+Version: 5.15
+Cflags:
+Libs: -L${QT5LIBDIR} -lQt5PlatformSupport -lQt5EventDispatcherSupport -lQt5FontDatabaseSupport -lQt5ThemeSupport -lQt5AccessibilitySupport
+PCEOF
 fi
 
-echo ">>> Patching makefile.unix for Windows cross-compile..."
+echo ">>> Running autogen.sh..."
+./autogen.sh
 
-# Remove GNU ld flags not supported by mingw
-sed -i "s/-Wl,-B\$(LMODE)//g; s/-Wl,-B\$(LMODE2)//g" src/makefile.unix 2>/dev/null || true
-sed -i "s/-Wl,-z,relro//g; s/-Wl,-z,now//g" src/makefile.unix 2>/dev/null || true
-sed -i "s/-l dl//g" src/makefile.unix 2>/dev/null || true
-sed -i "s/-l pthread//g" src/makefile.unix 2>/dev/null || true
-# Append Windows system libs
-echo "LIBS += -l ws2_32 -l mswsock -l shlwapi -l crypt32 -l iphlpapi -l kernel32" >> src/makefile.unix
+# Patch configure to skip static Qt plugin link tests (deps too complex for configure)
+# The actual make build handles Qt5 plugin deps correctly via .prl files
+echo ">>> Patching configure to skip Qt static plugin link tests..."
+sed -i "/as_fn_error.*Could not resolve/s/as_fn_error/true #/" configure
 
-echo ">>> Writing LevelDB build_config.mk..."
+echo ">>> Configuring for Windows ($HOST)..."
+./configure --host=$HOST --prefix=/usr/local \
+    --disable-tests --disable-bench \
+    --with-qt-plugindir=${MXE_SYSROOT}/qt5/plugins \
+    --with-boost=/opt/compat \
+    --with-boost-libdir=/opt/compat/lib \
+    '"$configure_extra"' \
+    CXXFLAGS="-O2 -DWIN32 -DMINIUPNP_STATICLIB -DBOOST_BIND_GLOBAL_PLACEHOLDERS" \
+    CFLAGS="-O2 -DWIN32" \
+    CPPFLAGS="-I/opt/compat/include ${QT5_CPPFLAGS}" \
+    LDFLAGS="-L/opt/compat/lib -L${MXE_SYSROOT}/lib -L${MXE_SYSROOT}/qt5/lib -static" \
+    BDB_CFLAGS="-I/opt/compat/include" \
+    BDB_LIBS="-L/opt/compat/lib -ldb_cxx-4.8 -ldb-4.8" \
+    PROTOC=/opt/mxe/usr/x86_64-pc-linux-gnu/bin/protoc
 
-echo "#!/bin/sh" > src/leveldb/build_detect_platform
-echo "touch \$1" >> src/leveldb/build_detect_platform
-chmod +x src/leveldb/build_detect_platform
+# The MXE Boost 1.81 headers emit duplicate category singletons when this legacy
+# tree is forced through C++11. Moving the Windows cross-build to C++17 avoids
+# those multiple-definition link failures without changing other host paths.
+find . -name Makefile -type f -exec sed -i "s/-std=c++11/-std=c++17/g" {} +
 
-cat > src/leveldb/build_config.mk << '\''LEVELDB_EOF'\''
-SOURCES=db/builder.cc db/c.cc db/db_impl.cc db/db_iter.cc db/dbformat.cc db/filename.cc db/log_reader.cc db/log_writer.cc db/memtable.cc db/repair.cc db/table_cache.cc db/version_edit.cc db/version_set.cc db/write_batch.cc table/block.cc table/block_builder.cc table/filter_block.cc table/format.cc table/iterator.cc table/merger.cc table/table.cc table/table_builder.cc table/two_level_iterator.cc util/arena.cc util/bloom.cc util/cache.cc util/coding.cc util/comparator.cc util/crc32c.cc util/env.cc util/env_win.cc util/filter_policy.cc util/hash.cc util/histogram.cc util/logging.cc util/options.cc util/status.cc port/port_win.cc
-MEMENV_SOURCES=helpers/memenv/memenv.cc
-CC=x86_64-w64-mingw32.static-gcc
-CXX=x86_64-w64-mingw32.static-g++
-AR=x86_64-w64-mingw32.static-ar
-PLATFORM=OS_WINDOWS
-PLATFORM_LDFLAGS=-lshlwapi
-PLATFORM_LIBS=
-PLATFORM_CCFLAGS= -fno-builtin-memcmp -D_REENTRANT -DOS_WIN -DLEVELDB_PLATFORM_WINDOWS -DWINVER=0x0500 -D__USE_MINGW_ANSI_STDIO=1 -DLEVELDB_IS_BIG_ENDIAN=0
-PLATFORM_CXXFLAGS= -fno-builtin-memcmp -D_REENTRANT -DOS_WIN -DLEVELDB_PLATFORM_WINDOWS -DWINVER=0x0500 -D__USE_MINGW_ANSI_STDIO=1 -DLEVELDB_IS_BIG_ENDIAN=0
-LEVELDB_EOF
+# Fix missing Qt translation files (Photon fork does not include them)
+if [ -f src/Makefile ]; then
+    sed -i "s/^QT_QM.*=.*/QT_QM =/" src/Makefile
+    sed -i "/bitcoin_.*\.qm/d" src/Makefile
+    sed -i "/locale\/.*\.qm/d" src/Makefile
+fi
+mkdir -p src/qt
+if [ -x /opt/mxe/usr/x86_64-pc-linux-gnu/bin/protoc ] && [ -f src/qt/paymentrequest.proto ]; then
+    echo ">>> Regenerating paymentrequest protobuf sources..."
+    (
+        cd src/qt
+        /opt/mxe/usr/x86_64-pc-linux-gnu/bin/protoc --cpp_out=. paymentrequest.proto
+    )
+fi
+cat > src/qt/bitcoin_locale.qrc <<QRC_EOF
+<!DOCTYPE RCC><RCC version="1.0">
+<qresource prefix="/translations">
+</qresource>
+</RCC>
+QRC_EOF
 
-# Check if Windows port files exist; fall back to posix if not
-if [ ! -f src/leveldb/port/port_win.cc ] || [ ! -f src/leveldb/util/env_win.cc ]; then
-    sed -i "s|port/port_win.cc|port/port_posix.cc|" src/leveldb/build_config.mk
-    sed -i "s|util/env_win.cc|util/env_posix.cc|" src/leveldb/build_config.mk
-    sed -i "s/OS_WINDOWS/OS_LINUX/g; s/LEVELDB_PLATFORM_WINDOWS/LEVELDB_PLATFORM_POSIX/g" src/leveldb/build_config.mk
+# Fix static link deps: use --start-group to resolve circular Qt5/platform plugin deps
+if [ -f src/Makefile ]; then
+    echo ">>> Fixing static link dependencies (--start-group for circular deps)..."
+    sed -i "s|^LIBS = \(.*\)|LIBS = -Wl,--start-group \1 -L${MXE_SYSROOT}/qt5/plugins/platforms -lqwindows -L${MXE_SYSROOT}/qt5/lib -lQt5Widgets -lQt5Gui -lQt5Network -lQt5Core -lQt5PlatformSupport -lQt5AccessibilitySupport -lQt5WindowsUIAutomationSupport -lQt5EventDispatcherSupport -lQt5FontDatabaseSupport -lQt5ThemeSupport -lharfbuzz -lfreetype -lharfbuzz_too -lfreetype_too -lbz2 -lpng16 -lbrotlidec -lbrotlicommon -lglib-2.0 -lintl -liconv -lpcre2-8 -lpcre2-16 -lzstd -lssl -lcrypto -ld3d11 -ldxgi -ldxguid -luxtheme -ldwmapi -ldnsapi -liphlpapi -lcrypt32 -lmpr -luserenv -lnetapi32 -lversion -lcomdlg32 -loleaut32 -limm32 -lshlwapi -latomic -lz -lws2_32 -lgdi32 -luser32 -lkernel32 -ladvapi32 -lole32 -lshell32 -luuid -lwinmm -lrpcrt4 -lssp -lwinspool -lcomctl32 -lwtsapi32 -lm -Wl,--end-group|" src/Makefile
 fi
 
-echo ">>> Building daemon with makefile.unix..."
-cd src
-make -f makefile.unix \
-    CC=${MXE_TARGET}-gcc \
-    CXX=${MXE_TARGET}-g++ \
-    AR=${MXE_TARGET}-ar \
-    RANLIB=${MXE_TARGET}-ranlib \
-    STRIP=${MXE_TARGET}-strip \
-    LINK=${MXE_TARGET}-g++ \
-    BOOST_INCLUDE_PATH=/opt/compat/include \
-    BOOST_LIB_PATH=/opt/compat/lib \
-    BDB_INCLUDE_PATH=/opt/compat/include \
-    BDB_LIB_PATH=/opt/compat/lib \
-    OPENSSL_INCLUDE_PATH=/opt/compat/include \
-    OPENSSL_LIB_PATH=/opt/compat/lib \
-    MINIUPNPC_INCLUDE_PATH='"$MXE_SYSROOT"'/include \
-    MINIUPNPC_LIB_PATH='"$MXE_SYSROOT"'/lib \
-    CXXFLAGS="-I/opt/compat/include -DWIN32 -DMINIUPNP_STATICLIB -DBOOST_BIND_GLOBAL_PLACEHOLDERS -Wno-maybe-uninitialized" \
-    LDFLAGS="-L/opt/compat/lib -L'"$MXE_SYSROOT"'/lib -static" \
-    TARGET_PLATFORM=windows \
-    USE_UPNP=1 \
-    -j'"$jobs"'
+if [ -f src/univalue/Makefile ]; then
+    echo ">>> Prebuilding libunivalue to avoid parallel archive races..."
+    make -C src/univalue -j1 libunivalue.la
+fi
 
-echo ">>> Stripping daemon..."
-${MXE_TARGET}-strip '"$DAEMON_NAME"'.exe 2>/dev/null || ${MXE_TARGET}-strip '"$DAEMON_NAME"' 2>/dev/null || true
-# Rename to .exe if not already
-[ ! -f '"$DAEMON_NAME"'.exe ] && [ -f '"$DAEMON_NAME"' ] && mv '"$DAEMON_NAME"' '"$DAEMON_NAME"'.exe
+if [ -f src/Makefile ]; then
+    echo ">>> Prebuilding libbitcoinconsensus serially to avoid MXE/libtool ordering issues..."
+    make -C src -j1 \
+        libbitcoinconsensus_la-arith_uint256.lo \
+        libbitcoinconsensus_la-hash.lo \
+        libbitcoinconsensus_la-pubkey.lo \
+        libbitcoinconsensus_la-uint256.lo \
+        libbitcoinconsensus_la-utilstrencodings.lo \
+        script/libbitcoinconsensus_la-script_error.lo \
+        libbitcoinconsensus.la
+fi
 
-echo ">>> Daemon build complete!"
-ls -lh '"$DAEMON_NAME"'.exe 2>/dev/null || ls -lh '"$DAEMON_NAME"' 2>/dev/null || true
+echo ">>> Building..."
+if ! make -j'"$jobs"'; then
+    echo ">>> Parallel build failed; retrying serial make to work around libtool archive races..."
+    make -j1
+fi
+
+echo ">>> Stripping binaries..."
+${HOST}-strip src/photond.exe 2>/dev/null || true
+${HOST}-strip src/qt/photon-qt.exe 2>/dev/null || true
+${HOST}-strip src/photon-cli.exe 2>/dev/null || true
+${HOST}-strip src/photon-tx.exe 2>/dev/null || true
+
+echo ">>> Build complete!"
+ls -lh src/photond.exe src/qt/photon-qt.exe src/photon-cli.exe src/photon-tx.exe 2>/dev/null || true
 '
 
-        info "Starting daemon build container: $daemon_container"
-        docker start -a "$daemon_container"
+    info "Starting build container: $container_name"
+    docker start -a "$container_name"
 
-        info "Extracting ${DAEMON_NAME}.exe..."
-        if docker cp "$daemon_container:/build/$COIN_NAME/src/${DAEMON_NAME}.exe" "$output_dir/daemon/${DAEMON_NAME}.exe" 2>/dev/null ||
-           docker cp "$daemon_container:/build/$COIN_NAME/src/${DAEMON_NAME}" "$output_dir/daemon/${DAEMON_NAME}.exe" 2>/dev/null; then
-            success "Windows daemon extracted to $output_dir/daemon/"
-            ls -lh "$output_dir/daemon/${DAEMON_NAME}.exe"
-        else
-            error "Could not find daemon .exe in container"
-            docker exec "$daemon_container" find /build/$COIN_NAME/src -name "*.exe" -o -name "$DAEMON_NAME" 2>/dev/null || true
-        fi
-
-        write_build_info "$output_dir/daemon" "windows-cross-compile" "daemon" "Docker: $DOCKER_WINDOWS (MXE)"
-        docker rm -f "$daemon_container" 2>/dev/null || true
+    # Extract binaries
+    if [[ "$target" == "daemon" || "$target" == "both" ]]; then
+        info "Extracting daemon binaries..."
+        docker cp "$container_name:/build/$COIN_NAME/src/photond.exe" "$output_dir/photond-${VERSION}.exe" 2>/dev/null || true
+        docker cp "$container_name:/build/$COIN_NAME/src/photon-cli.exe" "$output_dir/photon-cli-${VERSION}.exe" 2>/dev/null || true
+        docker cp "$container_name:/build/$COIN_NAME/src/photon-tx.exe" "$output_dir/photon-tx-${VERSION}.exe" 2>/dev/null || true
     fi
+
+    if [[ "$target" == "qt" || "$target" == "both" ]]; then
+        info "Extracting Qt wallet..."
+        docker cp "$container_name:/build/$COIN_NAME/src/qt/photon-qt.exe" "$output_dir/photon-qt-${VERSION}.exe" 2>/dev/null || true
+    fi
+
+    write_build_info "$output_dir" "windows" "$target" "Docker: $DOCKER_WINDOWS (MXE)"
+    CURRENT_OUTPUT_DIR="$output_dir"
+    GENERATE_CONFIG_AFTER_BUILD=0
+
+    docker rm -f "$container_name" 2>/dev/null || true
+    docker run --rm -v "$tmpdir:/cleanup" alpine rm -rf /cleanup 2>/dev/null || rm -rf "$tmpdir" 2>/dev/null || true
 
     echo ""
     echo "============================================"
-    echo "  BUILD SUCCESSFUL — Windows"
+    echo "  BUILD SUCCESSFUL  -  Windows"
     echo "  Output: $output_dir/"
     echo "============================================"
+    ls -lh "$output_dir"/*.exe "$output_dir"/build-info.txt 2>/dev/null || true
 }
 
 # =============================================================================
-# macOS CROSS-COMPILE (Docker + osxcross)
+# LEGACY macOS CROSS-COMPILE (Docker + osxcross + autotools)
+# Uses pre-built libs in osxcross-base image and skips depends/.
+# Kept as a fallback while the fork migrates toward a real depends pipeline.
+# =============================================================================
+
+build_macos_cross_legacy() {
+    local target="$1"
+    local jobs="$2"
+    local docker_mode="$3"
+    local container_name="mac-${COIN_NAME}-0152-build"
+    local output_dir=""
+
+    echo ""
+    echo "============================================"
+    echo "  macOS Cross-Compile: $COIN_NAME_UPPER $VERSION"
+    echo "============================================"
+    echo "  Image:    $DOCKER_MACOS"
+    echo "  Strategy: osxcross + autotools (pre-built libs)"
+    echo ""
+
+    output_dir="$(macos_output_dir)"
+    ensure_docker_image "$DOCKER_MACOS" "$docker_mode"
+    cleanup_legacy_output_root
+    cleanup_target_output_dir "$output_dir"
+    docker rm -f "$container_name" 2>/dev/null || true
+
+    # Copy source to temp dir
+    info "Copying source tree to temp build dir..."
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    cp -a "$SCRIPT_DIR"/. "$tmpdir/"
+    rm -rf "$tmpdir/outputs" "$tmpdir/.git"
+    clean_stale_build_artifacts "$tmpdir"
+    fix_permissions "$tmpdir"
+
+    local configure_extra=""
+    case "$target" in
+        daemon) configure_extra="--without-gui" ;;
+        qt)     configure_extra="--with-gui=qt5" ;;
+        both)   configure_extra="--with-gui=qt5" ;;
+    esac
+
+    docker create \
+        --name "$container_name" \
+        -v "$tmpdir:/build/$COIN_NAME:rw" \
+        "$DOCKER_MACOS" \
+        /bin/bash -c '
+set -e
+cd /build/'"$COIN_NAME"'
+
+# osxcross toolchain setup
+export PATH=/opt/osxcross/target/bin:$PATH
+export PREFIX=/opt/osxcross/target/macports/pkgs/opt/local
+# Auto-detect darwin version from available toolchain
+HOST=$(ls /opt/osxcross/target/bin/ | grep -oP "x86_64-apple-darwin[0-9.]+" | head -1)
+if [ -z "$HOST" ]; then echo "ERROR: Could not detect osxcross HOST triplet"; exit 1; fi
+
+echo ">>> osxcross environment:"
+echo "    HOST=$HOST"
+echo "    PREFIX=$PREFIX"
+echo "    CC=${HOST}-clang"
+echo "    CXX=${HOST}-clang++"
+which ${HOST}-clang++ || { echo "ERROR: Cross-compiler not found"; exit 1; }
+
+# --- Cross-compile libevent (missing from osxcross-base, needed by 0.15.2) ---
+echo ">>> Cross-compiling libevent..."
+cd /tmp
+curl -LO https://github.com/libevent/libevent/releases/download/release-2.1.12-stable/libevent-2.1.12-stable.tar.gz
+tar xf libevent-2.1.12-stable.tar.gz
+cd libevent-2.1.12-stable
+./configure --host=$HOST --prefix=$PREFIX \
+    --disable-shared --enable-static \
+    --disable-openssl --disable-samples --disable-libevent-regress \
+    CC=${HOST}-clang CXX=${HOST}-clang++ \
+    CFLAGS="-mmacosx-version-min=11.0" \
+    CXXFLAGS="-mmacosx-version-min=11.0"
+make -j'"$jobs"'
+make install
+echo ">>> libevent installed to $PREFIX"
+
+# --- Cross-compile protobuf (needed for Qt/BIP70) ---
+echo ">>> Cross-compiling protobuf..."
+apt-get update -qq && apt-get install -y -qq protobuf-compiler > /dev/null 2>&1
+cd /tmp
+curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v3.12.4/protobuf-cpp-3.12.4.tar.gz
+tar xf protobuf-cpp-3.12.4.tar.gz
+cd protobuf-3.12.4
+./configure --host=$HOST --prefix=$PREFIX \
+    --disable-shared --enable-static \
+    --with-protoc=/usr/bin/protoc \
+    CC=${HOST}-clang CXX=${HOST}-clang++ \
+    CFLAGS="-mmacosx-version-min=11.0" \
+    CXXFLAGS="-stdlib=libc++ -mmacosx-version-min=11.0" \
+    LDFLAGS="-stdlib=libc++"
+make -j'"$jobs"'
+make install
+echo ">>> protobuf installed to $PREFIX"
+
+# --- Build Photon ---
+cd /build/'"$COIN_NAME"'
+
+# Patch sources for Qt 5.15+ and Boost 1.73+ compatibility
+echo ">>> Patching sources..."
+if [ -f src/qt/trafficgraphwidget.cpp ]; then
+    grep -q "#include <QPainterPath>" src/qt/trafficgraphwidget.cpp || \
+        sed -i "1i #include <QPainterPath>" src/qt/trafficgraphwidget.cpp
+fi
+for f in $(grep -rl "boost::bind" src/ 2>/dev/null | grep "\.cpp$"); do
+    grep -q "boost/bind.hpp" "$f" || \
+        sed -i "1i #include <boost/bind.hpp>" "$f"
+done
+
+# Use system pkg-config instead of osxcross wrapper (which ignores PKG_CONFIG_PATH)
+export PKG_CONFIG=/usr/bin/pkg-config
+export PKG_CONFIG_LIBDIR="$PREFIX/qt5/lib/pkgconfig:$PREFIX/lib/pkgconfig"
+echo ">>> Using system pkg-config with PKG_CONFIG_LIBDIR=$PKG_CONFIG_LIBDIR"
+pkg-config --cflags Qt5Core 2>/dev/null && echo ">>> Qt5Core found" || echo "WARNING: Qt5Core not found"
+
+# Build Qt5 include flags (all module subdirs)
+QT5INC="$PREFIX/qt5/include"
+QT5_CPPFLAGS="-I${QT5INC}"
+for qtmod in QtCore QtGui QtWidgets QtNetwork QtDBus; do
+    [ -d "${QT5INC}/${qtmod}" ] && QT5_CPPFLAGS="${QT5_CPPFLAGS} -I${QT5INC}/${qtmod}"
+done
+echo ">>> Qt5 include flags: $QT5_CPPFLAGS"
+
+# Create Qt5PlatformSupport merged lib (split into multiple libs in Qt 5.14+)
+QT5LIBDIR="$PREFIX/qt5/lib"
+if [ ! -f "${QT5LIBDIR}/libQt5PlatformSupport.a" ]; then
+    echo ">>> Creating merged Qt5PlatformSupport.a from split modules..."
+    _qt5ps_save_dir=$(pwd)
+    mkdir -p /tmp/qt5ps && cd /tmp/qt5ps
+    for lib in EventDispatcherSupport FontDatabaseSupport ThemeSupport AccessibilitySupport ClipboardSupport GraphicsSupport ServiceSupport; do
+        [ -f "${QT5LIBDIR}/libQt5${lib}.a" ] && ar x "${QT5LIBDIR}/libQt5${lib}.a" 2>/dev/null || true
+    done
+    ar crs "${QT5LIBDIR}/libQt5PlatformSupport.a" *.o 2>/dev/null || true
+    cd "$_qt5ps_save_dir" && rm -rf /tmp/qt5ps
+    cat > "${QT5LIBDIR}/pkgconfig/Qt5PlatformSupport.pc" <<PCEOF
+Name: Qt5PlatformSupport
+Description: Merged compat lib for Qt 5.14+ (split into separate modules)
+Version: 5.15
+Cflags:
+Libs: -L${QT5LIBDIR} -lQt5PlatformSupport -lQt5EventDispatcherSupport -lQt5FontDatabaseSupport -lQt5ThemeSupport -lQt5AccessibilitySupport -lQt5ClipboardSupport -lQt5GraphicsSupport
+PCEOF
+fi
+
+echo ">>> Creating Boost -mt symlinks (configure looks for suffixed versions)..."
+for lib in $PREFIX/lib/libboost_*.a; do
+    mt="${lib%.a}-mt.a"
+    [ ! -f "$mt" ] && ln -sf "$(basename "$lib")" "$mt"
+done
+
+echo ">>> Running autogen.sh..."
+./autogen.sh
+
+# Patch configure to skip static Qt plugin link tests (deps too complex for configure)
+echo ">>> Patching configure to skip Qt static plugin link tests..."
+sed -i "/as_fn_error.*Could not resolve/s/as_fn_error/true #/" configure
+
+echo ">>> Configuring for macOS ($HOST)..."
+./configure --host=$HOST --prefix=/usr/local \
+    --disable-tests --disable-bench --disable-zmq \
+    --with-qt-plugindir=$PREFIX/qt5/plugins \
+    --with-boost=$PREFIX \
+    --with-boost-libdir=$PREFIX/lib \
+    '"$configure_extra"' \
+    CC=${HOST}-clang \
+    CXX=${HOST}-clang++ \
+    CXXFLAGS="-stdlib=libc++ -O2 -mmacosx-version-min=11.0 -DBOOST_BIND_GLOBAL_PLACEHOLDERS -DOBJC_OLD_DISPATCH_PROTOTYPES=1" \
+    CFLAGS="-O2 -mmacosx-version-min=11.0 -DOBJC_OLD_DISPATCH_PROTOTYPES=1" \
+    OBJCXXFLAGS="-stdlib=libc++ -O2 -mmacosx-version-min=11.0 -DOBJC_OLD_DISPATCH_PROTOTYPES=1" \
+    OBJCFLAGS="-O2 -mmacosx-version-min=11.0 -DOBJC_OLD_DISPATCH_PROTOTYPES=1" \
+    LDFLAGS="-L$PREFIX/lib -L$PREFIX/qt5/lib -stdlib=libc++ -mmacosx-version-min=11.0" \
+    CPPFLAGS="-I$PREFIX/include ${QT5_CPPFLAGS}" \
+    BDB_CFLAGS="-I$PREFIX/include" \
+    BDB_LIBS="-L$PREFIX/lib -ldb_cxx-4.8 -ldb-4.8" \
+    PKG_CONFIG=/usr/bin/pkg-config \
+    PROTOC=/usr/bin/protoc
+
+# Fix missing Qt translation files (Photon fork does not include them)
+if [ -f src/Makefile ]; then
+    sed -i "s/^QT_QM.*=.*/QT_QM =/" src/Makefile
+    sed -i "/bitcoin_.*\.qm/d" src/Makefile
+    sed -i "/locale\/.*\.qm/d" src/Makefile
+fi
+mkdir -p src/qt
+cat > src/qt/bitcoin_locale.qrc <<QRC_EOF
+<!DOCTYPE RCC><RCC version="1.0">
+<qresource prefix="/translations">
+</qresource>
+</RCC>
+QRC_EOF
+
+# Fix static link deps: Qt5 Cocoa plugin + platform support + bundled Qt libs + macOS frameworks
+if [ -f src/Makefile ]; then
+    echo ">>> Fixing static link dependencies (frameworks + Qt plugins)..."
+    sed -i "s|^LIBS = \(.*\)|LIBS = \1 -L$PREFIX/qt5/plugins/platforms -lqcocoa -L$PREFIX/qt5/lib -lQt5PrintSupport -lQt5Widgets -lQt5Gui -lQt5Network -lQt5Core -lQt5MacExtras -lQt5PlatformSupport -lQt5AccessibilitySupport -lQt5ClipboardSupport -lQt5EventDispatcherSupport -lQt5FontDatabaseSupport -lQt5GraphicsSupport -lQt5ServiceSupport -lQt5ThemeSupport $PREFIX/qt5/lib/libqtfreetype.a $PREFIX/qt5/lib/libqtharfbuzz.a $PREFIX/qt5/lib/libqtlibpng.a $PREFIX/qt5/lib/libqtpcre2.a -lz -lbz2 -lcups -framework SystemConfiguration -framework GSS -framework Carbon -framework IOKit -framework IOSurface -framework CoreVideo -framework Metal -framework QuartzCore -framework Cocoa -framework CoreGraphics -framework CoreText -framework CoreFoundation -framework Security -framework DiskArbitration -framework AppKit -framework ApplicationServices -framework Foundation -framework CoreServices|" src/Makefile
+fi
+
+echo ">>> Building..."
+make -j'"$jobs"'
+
+echo ">>> Stripping binaries..."
+${HOST}-strip src/photond 2>/dev/null || true
+${HOST}-strip src/photon-cli 2>/dev/null || true
+${HOST}-strip src/photon-tx 2>/dev/null || true
+if [[ "'"$target"'" == "qt" || "'"$target"'" == "both" ]]; then
+    ${HOST}-strip src/qt/photon-qt 2>/dev/null || true
+fi
+
+APP_NAME="Photon-Qt.app"
+if [[ "'"$target"'" == "qt" || "'"$target"'" == "both" ]]; then
+echo ">>> Creating macOS .app bundle..."
+rm -rf "$APP_NAME"
+mkdir -p "$APP_NAME/Contents/MacOS"
+mkdir -p "$APP_NAME/Contents/Resources"
+cp src/qt/photon-qt "$APP_NAME/Contents/MacOS/Photon-Qt"
+
+# Generate .icns icon from bitcoin.png
+ICONS_DIR="src/qt/res/icons"
+if [ -f "$ICONS_DIR/bitcoin.png" ]; then
+    echo ">>> Generating macOS icon from bitcoin.png..."
+    apt-get update -qq >/dev/null 2>&1 || true
+    apt-get install -y -qq python3-pil >/dev/null 2>&1 || true
+    python3 -c "
+from PIL import Image
+img = Image.open('"'"'$ICONS_DIR/bitcoin.png'"'"')
+img.save('"'"'$APP_NAME/Contents/Resources/${COIN_NAME}.icns'"'"')
+print('"'"'    Icon generated'"'"')
+" 2>/dev/null || echo "    Warning: Pillow icon conversion failed"
+fi
+
+# Create Info.plist
+cat > "$APP_NAME/Contents/Info.plist" << PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>Photon-Qt</string>
+    <key>CFBundleIdentifier</key>
+    <string>org.photon.Photon-Qt</string>
+    <key>CFBundleName</key>
+    <string>Photon-Qt</string>
+    <key>CFBundleDisplayName</key>
+    <string>Photon Core</string>
+    <key>CFBundleVersion</key>
+    <string>'"$VERSION"'</string>
+    <key>CFBundleShortVersionString</key>
+    <string>'"$VERSION"'</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleIconFile</key>
+    <string>photon</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.14</string>
+</dict>
+</plist>
+PLIST_EOF
+fi
+
+echo ">>> Build complete!"
+ls -lh src/photond src/qt/photon-qt src/photon-cli src/photon-tx 2>/dev/null || true
+if [[ "'"$target"'" == "qt" || "'"$target"'" == "both" ]]; then
+    ls -lh "$APP_NAME/Contents/MacOS/" 2>/dev/null || true
+fi
+'
+
+    info "Starting build container: $container_name"
+    docker start -a "$container_name"
+
+    # Extract binaries
+    if [[ "$target" == "daemon" || "$target" == "both" ]]; then
+        info "Extracting daemon binaries..."
+        docker cp "$container_name:/build/$COIN_NAME/src/photond" "$output_dir/photond-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/$COIN_NAME/src/photon-cli" "$output_dir/photon-cli-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/$COIN_NAME/src/photon-tx" "$output_dir/photon-tx-${VERSION}" 2>/dev/null || true
+    fi
+
+    if [[ "$target" == "qt" || "$target" == "both" ]]; then
+        info "Extracting Qt wallet (.app bundle)..."
+        local app_name="Photon-Qt.app"
+        rm -rf "$output_dir/$app_name" 2>/dev/null || true
+        if docker cp "$container_name:/build/$COIN_NAME/$app_name" "$output_dir/$app_name" 2>/dev/null; then
+            # Ensure binary inside .app is executable (docker cp can lose +x)
+            find "$output_dir/$app_name" -path "*/Contents/MacOS/*" -type f -exec chmod +x {} + 2>/dev/null || true
+            success "macOS app bundle extracted to $output_dir/"
+            ls -lh "$output_dir/$app_name/Contents/MacOS/" 2>/dev/null || true
+        else
+            error "Could not find .app bundle in container"
+            docker exec "$container_name" find /build/$COIN_NAME -name "*.app" -type d 2>/dev/null || true
+        fi
+        # Also copy raw binary for convenience
+        docker cp "$container_name:/build/$COIN_NAME/src/qt/photon-qt" "$output_dir/photon-qt-${VERSION}" 2>/dev/null || true
+    fi
+
+    write_build_info "$output_dir" "macos" "$target" "Docker: $DOCKER_MACOS (osxcross)"
+    CURRENT_OUTPUT_DIR="$output_dir"
+    GENERATE_CONFIG_AFTER_BUILD=0
+
+    docker rm -f "$container_name" 2>/dev/null || true
+    docker run --rm -v "$tmpdir:/cleanup" alpine rm -rf /cleanup 2>/dev/null || rm -rf "$tmpdir" 2>/dev/null || true
+
+    echo ""
+    echo "============================================"
+    echo "  BUILD SUCCESSFUL  -  macOS"
+    echo "  Output: $output_dir/"
+    echo "============================================"
+    ls -lh "$output_dir"/* 2>/dev/null || true
+}
+
+# =============================================================================
+# macOS CROSS-COMPILE (Docker + depends + autotools)
+# Default path: Bitcoin-style depends + CONFIG_SITE inside the osxcross image
 # =============================================================================
 
 build_macos_cross() {
     local target="$1"
     local jobs="$2"
     local docker_mode="$3"
-    local container_name="mac-${COIN_NAME}-build"
-    local output_dir="$OUTPUT_BASE/macos"
+    local container_name="mac-${COIN_NAME}-0152-build"
+    local output_dir=""
+    local tmpdir=""
+    local build_strategy="${MACOS_CROSS_STRATEGY:-depends}"
+    local build_note=""
+
+    if [[ "$build_strategy" == "legacy" ]]; then
+        warn "Using legacy macOS cross-build path because MACOS_CROSS_STRATEGY=legacy"
+        build_macos_cross_legacy "$target" "$jobs" "$docker_mode"
+        return
+    fi
 
     echo ""
     echo "============================================"
-    echo "  macOS Cross-Compile: $COIN_NAME_UPPER"
+    echo "  macOS Cross-Compile: $COIN_NAME_UPPER $VERSION"
     echo "============================================"
-    echo "  Image:  $DOCKER_MACOS"
-    echo "  Target: $target"
+    echo "  Image:    $DOCKER_MACOS"
+    echo "  Strategy: depends + CONFIG_SITE + autotools"
     echo ""
 
-    ensure_docker_image "$DOCKER_MACOS" "$docker_mode" "Dockerfile.osxcross-base"
-    mkdir -p "$output_dir/qt" "$output_dir/daemon"
+    output_dir="$(macos_output_dir)"
+    ensure_docker_image "$DOCKER_MACOS" "$docker_mode"
+    cleanup_legacy_output_root
+    cleanup_target_output_dir "$output_dir"
     docker rm -f "$container_name" 2>/dev/null || true
 
-    if [[ "$target" == "qt" || "$target" == "both" ]]; then
-        info "Building Qt wallet for macOS..."
+    info "Copying source tree to temp build dir..."
+    tmpdir=$(mktemp -d)
+    copy_source_tree_to_tempdir "$tmpdir"
+    rm -rf "$tmpdir/release"
+    clean_stale_build_artifacts "$tmpdir"
+    fix_permissions "$tmpdir"
 
-        # Copy local source to temp dir for volume-mount (uses already-patched files)
-        info "Copying local source to temp build dir..."
-        local tmpdir_macos
-        tmpdir_macos=$(mktemp -d)
-        cp -a "$SCRIPT_DIR/src" "$SCRIPT_DIR/share" "$tmpdir_macos/"
-        cp -a "$SCRIPT_DIR"/*.pro "$tmpdir_macos/" 2>/dev/null || true
-
-        docker create \
-            --name "$container_name" \
-            -v "$tmpdir_macos:/build/$COIN_NAME:rw" \
-            "$DOCKER_MACOS" \
-            /bin/bash -c '
-set -e
-
-HOST="'"$OSXCROSS_HOST"'"
-PREFIX="'"$MACPORTS_PREFIX"'"
-OSXCROSS="'"$OSXCROSS_TARGET"'"
-
+    docker create \
+        --name "$container_name" \
+        -e BLAKE_TARGET="$target" \
+        -e BLAKE_JOBS="$jobs" \
+        -v "$tmpdir:/build/$COIN_NAME:rw" \
+        "$DOCKER_MACOS" \
+        /bin/bash -lc '
+set -euo pipefail
 cd /build/'"$COIN_NAME"'
 
-echo ">>> Patching .pro file..."
+HOST="${OSXCROSS_HOST:-}"
+if [[ -z "$HOST" ]]; then
+    HOST=$(ls /opt/osxcross/target/bin/ 2>/dev/null | grep -oE "x86_64-apple-darwin[0-9.]+" | head -1 || true)
+fi
+if [[ -z "$HOST" ]]; then
+    echo "ERROR: Could not detect macOS host triplet"
+    exit 1
+fi
 
-PRO_FILE=$(find . -maxdepth 1 -name "*.pro" ! -iname "*-OSX*" ! -iname "*OSX*" | head -1)
+SDK_ROOT="/opt/osxcross/target/SDK"
+SDK_NAME="${OSXCROSS_SDK:-}"
+if [[ -z "$SDK_NAME" ]]; then
+    SDK_NAME=$(find "$SDK_ROOT" -maxdepth 1 -type d -name "MacOSX*.sdk" -printf "%f\n" | sort | tail -1 || true)
+fi
+if [[ -z "$SDK_NAME" || ! -d "$SDK_ROOT/$SDK_NAME" ]]; then
+    echo "ERROR: Could not locate macOS SDK under $SDK_ROOT"
+    exit 1
+fi
+SDK_VERSION="${SDK_NAME#MacOSX}"
+SDK_VERSION="${SDK_VERSION%.sdk}"
 
-# Fix qmake syntax
-# Why: qmake uses = not := for variable assignment
-sed -i "s/USE_UPNP:=1/USE_UPNP=1/" "$PRO_FILE"
+LD64_VERSION="$(${HOST}-ld -v 2>&1 | sed -n "s/.*PROJECT:ld64-\([0-9.]*\).*/\1/p" | head -1)"
+if [[ -z "$LD64_VERSION" ]]; then
+    echo "ERROR: Could not detect ld64 version"
+    exit 1
+fi
 
-# Fix lrelease path
-# Why: Windows-specific path separator doesnt work on other platforms
-sed -i "s|\\\\\\\\lrelease.exe|/lrelease|" "$PRO_FILE"
+DEPENDS_ARGS=()
+if [[ "$BLAKE_TARGET" == "daemon" ]]; then
+    DEPENDS_ARGS+=(NO_QT=1)
+    CONFIGURE_EXTRA="--without-gui"
+else
+    CONFIGURE_EXTRA="--with-gui=qt5"
+fi
 
-# Replace dependency paths with MacPorts cross-compiled prefix
-sed -i "s|BOOST_INCLUDE_PATH=.*|BOOST_INCLUDE_PATH=$PREFIX/include|" "$PRO_FILE"
-sed -i "s|BOOST_LIB_PATH=.*|BOOST_LIB_PATH=$PREFIX/lib|" "$PRO_FILE"
-sed -i "s|BDB_INCLUDE_PATH=.*|BDB_INCLUDE_PATH=$PREFIX/include|" "$PRO_FILE"
-sed -i "s|BDB_LIB_PATH=.*|BDB_LIB_PATH=$PREFIX/lib|" "$PRO_FILE"
-sed -i "s|OPENSSL_INCLUDE_PATH=.*|OPENSSL_INCLUDE_PATH=$PREFIX/include|" "$PRO_FILE"
-sed -i "s|OPENSSL_LIB_PATH=.*|OPENSSL_LIB_PATH=$PREFIX/lib|" "$PRO_FILE"
-sed -i "s|MINIUPNPC_INCLUDE_PATH=.*|MINIUPNPC_INCLUDE_PATH=$PREFIX/include|" "$PRO_FILE"
-sed -i "s|MINIUPNPC_LIB_PATH=.*|MINIUPNPC_LIB_PATH=$PREFIX/lib|" "$PRO_FILE"
+echo ">>> depends environment:"
+echo "    HOST=$HOST"
+echo "    SDK_ROOT=$SDK_ROOT"
+echo "    SDK_NAME=$SDK_NAME"
+echo "    SDK_VERSION=$SDK_VERSION"
+echo "    LD64_VERSION=$LD64_VERSION"
+echo "    TARGET=$BLAKE_TARGET"
 
-# Remove hardcoded boost suffix
-# Why: Suffix like -mgw54-mt-s-x32-1_71 is MinGW-specific
-sed -i "s/BOOST_LIB_SUFFIX=-mgw[^ ]*/BOOST_LIB_SUFFIX=/" "$PRO_FILE"
-sed -i "/isEmpty(BOOST_LIB_SUFFIX)/,/^}/ s/^/#/" "$PRO_FILE"
-sed -i "/-lboost_system-mgw[^ ]*/d" "$PRO_FILE"
+echo ">>> Building depends..."
+make -C depends \
+    HOST="$HOST" \
+    SDK_PATH="$SDK_ROOT" \
+    OSX_SDK_VERSION="$SDK_VERSION" \
+    OSX_MIN_VERSION=11.0 \
+    LD64_VERSION="$LD64_VERSION" \
+    darwin_native_toolchain= \
+    darwin_native_packages= \
+    build_CC=clang \
+    build_CXX=clang++ \
+    NO_ZMQ=1 \
+    "${DEPENDS_ARGS[@]}" \
+    -j"$BLAKE_JOBS"
 
-# Remove hardcoded Windows C: paths
-sed -i "/^[A-Z_]*_PATH\s*=\s*[Cc]:/d" "$PRO_FILE"
+echo ">>> Verifying Berkeley DB 4.8 from depends..."
+if [[ ! -f "depends/$HOST/include/db_cxx.h" ]]; then
+    echo "ERROR: depends prefix is missing db_cxx.h for $HOST"
+    exit 1
+fi
+if [[ ! -f "depends/$HOST/lib/libdb_cxx-4.8.a" || ! -f "depends/$HOST/lib/libdb-4.8.a" ]]; then
+    echo "ERROR: depends prefix is not using Berkeley DB 4.8 static libs for $HOST"
+    exit 1
+fi
 
-# Add BOOST_BIND_GLOBAL_PLACEHOLDERS
-# Why: Boost 1.73+ deprecated global placeholders
-grep -q "BOOST_BIND_GLOBAL_PLACEHOLDERS" "$PRO_FILE" || \
-    sed -i "/^DEFINES/s/$/ BOOST_BIND_GLOBAL_PLACEHOLDERS/" "$PRO_FILE"
+BOOST_PREFIX="$PWD/depends/$HOST"
+CONFIGURE_EXTRA="$CONFIGURE_EXTRA --with-boost=$BOOST_PREFIX --with-boost-libdir=$BOOST_PREFIX/lib"
 
-echo ">>> Patching source files..."
+echo ">>> Running autogen.sh..."
+./autogen.sh
 
-# Add boost/bind.hpp includes
-# Why: Boost 1.81+ requires explicit include for boost::bind
-sed -i "/#include \"clientmodel.h\"/a #include <boost/bind.hpp>" src/qt/clientmodel.cpp
-sed -i "/#include \"walletmodel.h\"/a #include <boost/bind.hpp>" src/qt/walletmodel.cpp
+echo ">>> Configuring with CONFIG_SITE..."
+CONFIG_SITE="$PWD/depends/$HOST/share/config.site" \
+CXXFLAGS="${CXXFLAGS:-} -Wno-enum-constexpr-conversion" \
+OBJCXXFLAGS="${OBJCXXFLAGS:-} -Wno-enum-constexpr-conversion" \
+./configure \
+    --prefix=/ \
+    --disable-tests \
+    --disable-bench \
+    --disable-zmq \
+    $CONFIGURE_EXTRA
 
-# Qualify filesystem:: with boost:: namespace
-# Why: macOS clang is stricter about namespace resolution; unqualified fails
-FILESYSTEM_FILES="src/bitcoinrpc.cpp src/util.cpp src/walletdb.cpp src/init.cpp src/wallet.cpp src/db.cpp src/net.cpp"
-for f in $FILESYSTEM_FILES; do
-    if [ -f "$f" ]; then
-        sed -i "s/\bfilesystem::/boost::filesystem::/g" "$f"
-        sed -i "s/boost::boost::filesystem::/boost::filesystem::/g" "$f"
+echo ">>> Building Photon..."
+make -j"$BLAKE_JOBS"
+
+if [[ "$BLAKE_TARGET" == "qt" || "$BLAKE_TARGET" == "both" ]]; then
+    if [[ -f share/qt/Info.plist ]]; then
+        sed -i \
+            -e "s/Bitcoin-Qt/Photon-Qt/g" \
+            -e "s/org.bitcoinfoundation.Bitcoin-Qt/org.photon.Photon-Qt/g" \
+            -e "s/org.bitcoin.BitcoinPayment/org.photon.PhotonPayment/g" \
+            -e "s/org.bitcoin.paymentrequest/org.photon.paymentrequest/g" \
+            -e "s/Bitcoin payment request/Photon payment request/g" \
+            -e "s/application\/x-bitcoin-payment-request/application\/x-${COIN_NAME}-payment-request/g" \
+            -e "s|<string>bitcoin</string>|<string>photon</string>|g" \
+            share/qt/Info.plist
     fi
-done
 
-# Fix deprecated Boost.Filesystem APIs (these are already applied in local source,
-# but the macOS Boost version may need the newer API names)
-sed -i "s/\.is_complete()/.is_absolute()/g" src/*.cpp
-sed -i "s/copy_option::overwrite_if_exists/copy_options::overwrite_existing/g" src/*.cpp
-sed -i "s|#include <boost/filesystem/convenience.hpp>|#include <boost/filesystem.hpp>|g" src/*.cpp
+    echo ">>> Creating app bundle..."
+    make appbundle
 
-# Boost 1.80+ removed get_io_service() from sockets/acceptors/streams
-# Why: Deprecated in Boost 1.70, removed in 1.80; use get_executor() instead
-if [ -f src/bitcoinrpc.cpp ]; then
-    sed -i "s/resolver(stream\.get_io_service())/resolver(stream.get_executor())/g" src/bitcoinrpc.cpp
-    perl -i -pe '"'"'s/acceptor->get_io_service\(\)/static_cast<boost::asio::io_context\&>(acceptor->get_executor().context())/'"'"' src/bitcoinrpc.cpp
+    if [[ -d Bitcoin-Qt.app ]]; then
+        rm -rf Photon-Qt.app
+        mv Bitcoin-Qt.app Photon-Qt.app
+        if [[ -f Photon-Qt.app/Contents/MacOS/Bitcoin-Qt ]]; then
+            mv Photon-Qt.app/Contents/MacOS/Bitcoin-Qt Photon-Qt.app/Contents/MacOS/Photon-Qt
+        fi
+    fi
 fi
-
-# Fix C++11 string literal spacing for PRI macros
-# Why: clang enforces C99/C11 macro spacing strictly
-find src/ -name "*.cpp" -o -name "*.h" | \
-    xargs sed -i -E "s/\"(PRI[a-zA-Z0-9]+)/\" \1/g"
-
-echo ">>> Writing LevelDB build_config.mk..."
-
-# Override build_detect_platform (doesnt work for cross-compilation)
-echo "#!/bin/sh" > src/leveldb/build_detect_platform
-echo "touch \$1" >> src/leveldb/build_detect_platform
-chmod +x src/leveldb/build_detect_platform
-
-cat > src/leveldb/build_config.mk << '\''LEVELDB_EOF'\''
-SOURCES=db/builder.cc db/c.cc db/db_impl.cc db/db_iter.cc db/dbformat.cc db/dumpfile.cc db/filename.cc db/log_reader.cc db/log_writer.cc db/memtable.cc db/repair.cc db/table_cache.cc db/version_edit.cc db/version_set.cc db/write_batch.cc table/block.cc table/block_builder.cc table/filter_block.cc table/format.cc table/iterator.cc table/merger.cc table/table.cc table/table_builder.cc table/two_level_iterator.cc util/arena.cc util/bloom.cc util/cache.cc util/coding.cc util/comparator.cc util/crc32c.cc util/env.cc util/env_posix.cc util/filter_policy.cc util/hash.cc util/histogram.cc util/logging.cc util/options.cc util/status.cc port/port_posix.cc
-MEMENV_SOURCES=helpers/memenv/memenv.cc
-LEVELDB_EOF
-
-# Set compiler paths in build_config.mk (needs variable expansion)
-echo "CC=$OSXCROSS/bin/${HOST}-clang" >> src/leveldb/build_config.mk
-echo "CXX=$OSXCROSS/bin/${HOST}-clang++" >> src/leveldb/build_config.mk
-echo "PLATFORM=OS_MACOSX" >> src/leveldb/build_config.mk
-echo "PLATFORM_LDFLAGS=" >> src/leveldb/build_config.mk
-echo "PLATFORM_LIBS=" >> src/leveldb/build_config.mk
-echo "PLATFORM_CCFLAGS= -DOS_MACOSX -DLEVELDB_PLATFORM_POSIX" >> src/leveldb/build_config.mk
-echo "PLATFORM_CXXFLAGS= -DOS_MACOSX -DLEVELDB_PLATFORM_POSIX" >> src/leveldb/build_config.mk
-echo "PLATFORM_SHARED_EXT=" >> src/leveldb/build_config.mk
-echo "PLATFORM_SHARED_LDFLAGS=" >> src/leveldb/build_config.mk
-echo "PLATFORM_SHARED_CFLAGS=" >> src/leveldb/build_config.mk
-echo "AR=$OSXCROSS/bin/${HOST}-ar" >> src/leveldb/build_config.mk
-
-# Regenerate bitcoin.icns from bitcoin.png to ensure correct coin branding
-# Why: Repo may contain stale Bitcoin icns from upstream; must match bitcoin.png
-# Uses Pillow ICNS writer (same approach as lib/macos.sh + convert-icon.sh)
-ICONS_DIR="src/qt/res/icons"
-if [ -f "$ICONS_DIR/bitcoin.png" ]; then
-    echo ">>> Regenerating macOS icon from bitcoin.png..."
-    rm -f "$ICONS_DIR/bitcoin.icns"
-    apt-get update -qq >/dev/null 2>&1 || true
-    apt-get install -y -qq python3-pil >/dev/null 2>&1 || true
-    python3 -c "
-from PIL import Image
-img = Image.open('"'"'$ICONS_DIR/bitcoin.png'"'"')
-img.save('"'"'$ICONS_DIR/bitcoin.icns'"'"')
-print('"'"'    Icon generated from bitcoin.png'"'"')
-" 2>/dev/null || echo "    Warning: Pillow icon conversion failed; using existing icns"
-fi
-
-echo ">>> Running qmake..."
-$PREFIX/qt5/bin/qmake "$PRO_FILE" \
-    -spec macx-osxcross \
-    "CONFIG+=release" \
-    "QMAKE_CC=$OSXCROSS/bin/${HOST}-clang" \
-    "QMAKE_CXX=$OSXCROSS/bin/${HOST}-clang++" \
-    "QMAKE_LINK=$OSXCROSS/bin/${HOST}-clang++" \
-    "QMAKE_AR=$OSXCROSS/bin/${HOST}-ar cqs" \
-    "QMAKE_RANLIB=$OSXCROSS/bin/${HOST}-ranlib" \
-    "QMAKE_LFLAGS+=-stdlib=libc++" \
-    "QMAKE_CXXFLAGS+=-stdlib=libc++" \
-    "USE_UPNP=1" \
-    "USE_QRCODE=0"
-
-# Fix AR path in generated Makefile
-# Why: qmake sets AR with "cqs" suffix but LevelDB makefile expects bare ar command
-sed -i "s|AR            = .*/ar cqs|AR            = $OSXCROSS/bin/${HOST}-ar|" Makefile
-
-echo ">>> Building with make..."
-make -j'"$jobs"' \
-    CC=$OSXCROSS/bin/${HOST}-clang \
-    CXX=$OSXCROSS/bin/${HOST}-clang++ \
-    AR=$OSXCROSS/bin/${HOST}-ar
-
-echo ">>> Stripping binary..."
-BINARY_NAME="'"$COIN_NAME_UPPER"'-Qt"
-$OSXCROSS/bin/${HOST}-strip ${BINARY_NAME}.app/Contents/MacOS/${BINARY_NAME} 2>/dev/null || \
-    $OSXCROSS/bin/${HOST}-strip '"$COIN_NAME_UPPER"'-Qt.app/Contents/MacOS/* 2>/dev/null || true
-
-# Fix Info.plist branding
-# Why: qmake generates Bitcoin-Qt branding from upstream .pro; fix to match coin name
-# CFBundleExecutable must match the actual binary name or macOS shows "damaged" error
-sed -i "s|<string>Bitcoin-Qt</string>|<string>'"$COIN_NAME_UPPER"'-Qt</string>|g" \
-    ${BINARY_NAME}.app/Contents/Info.plist 2>/dev/null || true
-sed -i "s|org.bitcoinfoundation.Bitcoin-Qt|org.'"$COIN_NAME"'.'"$COIN_NAME_UPPER"'-Qt|g" \
-    ${BINARY_NAME}.app/Contents/Info.plist 2>/dev/null || true
-sed -i "s|org.bitcoinfoundation.BitcoinPayment|org.'"$COIN_NAME"'.'"$COIN_NAME_UPPER"'Payment|g" \
-    ${BINARY_NAME}.app/Contents/Info.plist 2>/dev/null || true
-sed -i "s|<string>bitcoin</string>|<string>'"$COIN_NAME"'</string>|g" \
-    ${BINARY_NAME}.app/Contents/Info.plist 2>/dev/null || true
-sed -i '"'"'s|\$VERSION|0.8.6|g'"'"' ${BINARY_NAME}.app/Contents/Info.plist 2>/dev/null || true
-sed -i '"'"'s|\$YEAR|2024|g'"'"' ${BINARY_NAME}.app/Contents/Info.plist 2>/dev/null || true
-sed -i "s|The Bitcoin developers|The '"$COIN_NAME_UPPER"' developers|g" \
-    ${BINARY_NAME}.app/Contents/Info.plist 2>/dev/null || true
 
 echo ">>> Build complete!"
-ls -lh ${BINARY_NAME}.app/Contents/MacOS/ 2>/dev/null || true
-file ${BINARY_NAME}.app/Contents/MacOS/* 2>/dev/null || true
-'
+ls -lh src/photond src/photon-cli src/photon-tx 2>/dev/null || true
+if [[ "$BLAKE_TARGET" == "qt" || "$BLAKE_TARGET" == "both" ]]; then
+    ls -lh src/qt/photon-qt 2>/dev/null || true
+    ls -lh Photon-Qt.app/Contents/MacOS/ 2>/dev/null || true
+fi
+' >/dev/null
 
-        info "Starting build container: $container_name"
-        docker start -a "$container_name"
-
-        info "Extracting macOS .app bundle..."
-        local app_name="${COIN_NAME_UPPER}-Qt.app"
-        # Remove old .app to prevent docker cp from creating nested .app structure
-        rm -rf "$output_dir/qt/$app_name" 2>/dev/null || true
-        if docker cp "$container_name:/build/$COIN_NAME/$app_name" "$output_dir/qt/$app_name" 2>/dev/null; then
-            # Ensure binaries inside .app bundles are executable (docker cp can lose +x)
-            find "$output_dir/qt/$app_name" -path "*/Contents/MacOS/*" -type f -exec chmod +x {} + 2>/dev/null || true
-            success "macOS app bundle extracted to $output_dir/qt/"
-            ls -lh "$output_dir/qt/$app_name/Contents/MacOS/" 2>/dev/null || true
-            file "$output_dir/qt/$app_name/Contents/MacOS/"* 2>/dev/null || true
-        else
-            error "Could not find .app bundle in container"
-            docker exec "$container_name" find /build/$COIN_NAME -name "*.app" -type d 2>/dev/null || true
-            docker rm -f "$container_name" 2>/dev/null || true
-            docker run --rm -v "$tmpdir_macos:/cleanup" alpine rm -rf /cleanup 2>/dev/null || rm -rf "$tmpdir_macos" 2>/dev/null || true
-            exit 1
-        fi
-
-        write_build_info "$output_dir/qt" "macos-cross-compile" "qt" "Docker: $DOCKER_MACOS (osxcross)"
-        docker rm -f "$container_name" 2>/dev/null || true
-        docker run --rm -v "$tmpdir_macos:/cleanup" alpine rm -rf /cleanup 2>/dev/null || rm -rf "$tmpdir_macos" 2>/dev/null || true
-    fi
+    info "Starting build container: $container_name"
+    docker start -a "$container_name"
 
     if [[ "$target" == "daemon" || "$target" == "both" ]]; then
-        info "Building daemon for macOS..."
-        local daemon_container="mac-${COIN_NAME}-daemon"
-        docker rm -f "$daemon_container" 2>/dev/null || true
-
-        # Copy local source to temp dir for volume-mount
-        info "Copying local source to temp build dir..."
-        local tmpdir_daemon
-        tmpdir_daemon=$(mktemp -d)
-        cp -a "$SCRIPT_DIR/src" "$SCRIPT_DIR/share" "$tmpdir_daemon/"
-
-        docker create \
-            --name "$daemon_container" \
-            -v "$tmpdir_daemon:/build/$COIN_NAME:rw" \
-            "$DOCKER_MACOS" \
-            /bin/bash -c '
-set -e
-
-HOST="'"$OSXCROSS_HOST"'"
-PREFIX="'"$MACPORTS_PREFIX"'"
-OSXCROSS="'"$OSXCROSS_TARGET"'"
-
-cd /build/'"$COIN_NAME"'
-
-echo ">>> Patching source files..."
-
-# Add boost/bind.hpp includes
-for f in src/qt/clientmodel.cpp src/qt/walletmodel.cpp; do
-    if [ -f "$f" ] && ! grep -q "boost/bind.hpp" "$f"; then
-        sed -i "1a #include <boost/bind.hpp>" "$f"
+        info "Extracting daemon binaries..."
+        docker cp "$container_name:/build/$COIN_NAME/src/photond" "$output_dir/photond-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/$COIN_NAME/src/photon-cli" "$output_dir/photon-cli-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/$COIN_NAME/src/photon-tx" "$output_dir/photon-tx-${VERSION}" 2>/dev/null || true
     fi
-done
 
-# Qualify filesystem:: with boost:: namespace
-for f in src/bitcoinrpc.cpp src/util.cpp src/walletdb.cpp src/init.cpp src/wallet.cpp src/db.cpp src/net.cpp src/main.cpp; do
-    if [ -f "$f" ]; then
-        sed -i "s/\bfilesystem::/boost::filesystem::/g" "$f"
-        sed -i "s/boost::boost::filesystem::/boost::filesystem::/g" "$f"
-    fi
-done
-
-# Fix deprecated Boost.Filesystem APIs
-sed -i "s/\.is_complete()/.is_absolute()/g" src/*.cpp 2>/dev/null || true
-sed -i "s/copy_option::overwrite_if_exists/copy_options::overwrite_existing/g" src/*.cpp 2>/dev/null || true
-sed -i "s|#include <boost/filesystem/convenience.hpp>|#include <boost/filesystem.hpp>|g" src/*.cpp 2>/dev/null || true
-
-# Fix Boost.Asio get_io_service() removed in Boost 1.80+
-if [ -f src/bitcoinrpc.cpp ]; then
-    sed -i "s/resolver(stream\.get_io_service())/resolver(stream.get_executor())/g" src/bitcoinrpc.cpp
-    perl -i -pe '"'"'s/acceptor->get_io_service\(\)/static_cast<boost::asio::io_context\&>(acceptor->get_executor().context())/'"'"' src/bitcoinrpc.cpp
-fi
-
-# Fix C++11 string literal spacing for PRI macros (clang strict)
-find src/ -name "*.cpp" -o -name "*.h" | \
-    xargs sed -i -E "s/\"(PRI[a-zA-Z0-9]+)/\" \1/g" 2>/dev/null || true
-
-echo ">>> Patching makefile.unix for macOS cross-compile..."
-
-# Fix makefile.unix: compile .c files with CC, not CXX (clang rejects void* casts)
-if [ -f src/makefile.unix ]; then
-    sed -i '"'"'/^obj\/%.o: %.c$/,/^\t\$(CXX)/ s/\$(CXX)/\$(CC)/'"'"' src/makefile.unix 2>/dev/null || true
-    sed -i '"'"'/^obj\/%.o: %.c$/,/xCXXFLAGS/ s/xCXXFLAGS/xCFLAGS/'"'"' src/makefile.unix 2>/dev/null || true
-fi
-
-# Remove GNU ld flags not supported by Apple linker
-if [ -f src/makefile.unix ]; then
-    sed -i "s/-Wl,-B\$(LMODE)//g; s/-Wl,-B\$(LMODE2)//g" src/makefile.unix 2>/dev/null || true
-    sed -i "s/-Wl,-z,relro//g; s/-Wl,-z,now//g" src/makefile.unix 2>/dev/null || true
-    sed -i "s/-l dl//g" src/makefile.unix 2>/dev/null || true
-fi
-
-echo ">>> Writing LevelDB build_config.mk..."
-
-echo "#!/bin/sh" > src/leveldb/build_detect_platform
-echo "touch \$1" >> src/leveldb/build_detect_platform
-chmod +x src/leveldb/build_detect_platform
-
-cat > src/leveldb/build_config.mk << '\''LEVELDB_EOF'\''
-SOURCES=db/builder.cc db/c.cc db/db_impl.cc db/db_iter.cc db/dbformat.cc db/dumpfile.cc db/filename.cc db/log_reader.cc db/log_writer.cc db/memtable.cc db/repair.cc db/table_cache.cc db/version_edit.cc db/version_set.cc db/write_batch.cc table/block.cc table/block_builder.cc table/filter_block.cc table/format.cc table/iterator.cc table/merger.cc table/table.cc table/table_builder.cc table/two_level_iterator.cc util/arena.cc util/bloom.cc util/cache.cc util/coding.cc util/comparator.cc util/crc32c.cc util/env.cc util/env_posix.cc util/filter_policy.cc util/hash.cc util/histogram.cc util/logging.cc util/options.cc util/status.cc port/port_posix.cc
-MEMENV_SOURCES=helpers/memenv/memenv.cc
-LEVELDB_EOF
-
-echo "CC=$OSXCROSS/bin/${HOST}-clang" >> src/leveldb/build_config.mk
-echo "CXX=$OSXCROSS/bin/${HOST}-clang++" >> src/leveldb/build_config.mk
-echo "PLATFORM=OS_MACOSX" >> src/leveldb/build_config.mk
-echo "PLATFORM_LDFLAGS=" >> src/leveldb/build_config.mk
-echo "PLATFORM_LIBS=" >> src/leveldb/build_config.mk
-echo "PLATFORM_CCFLAGS= -DOS_MACOSX -DLEVELDB_PLATFORM_POSIX" >> src/leveldb/build_config.mk
-echo "PLATFORM_CXXFLAGS= -DOS_MACOSX -DLEVELDB_PLATFORM_POSIX" >> src/leveldb/build_config.mk
-echo "PLATFORM_SHARED_EXT=" >> src/leveldb/build_config.mk
-echo "PLATFORM_SHARED_LDFLAGS=" >> src/leveldb/build_config.mk
-echo "PLATFORM_SHARED_CFLAGS=" >> src/leveldb/build_config.mk
-echo "AR=$OSXCROSS/bin/${HOST}-ar" >> src/leveldb/build_config.mk
-
-echo ">>> Building daemon with makefile.unix..."
-cd src
-make -f makefile.unix \
-    CC=$OSXCROSS/bin/${HOST}-clang \
-    CXX=$OSXCROSS/bin/${HOST}-clang++ \
-    AR=$OSXCROSS/bin/${HOST}-ar \
-    RANLIB=$OSXCROSS/bin/${HOST}-ranlib \
-    STRIP=$OSXCROSS/bin/${HOST}-strip \
-    LINK=$OSXCROSS/bin/${HOST}-clang++ \
-    BOOST_INCLUDE_PATH=$PREFIX/include \
-    BOOST_LIB_PATH=$PREFIX/lib \
-    BDB_INCLUDE_PATH=$PREFIX/include \
-    BDB_LIB_PATH=$PREFIX/lib \
-    OPENSSL_INCLUDE_PATH=$PREFIX/include \
-    OPENSSL_LIB_PATH=$PREFIX/lib \
-    MINIUPNPC_INCLUDE_PATH=$PREFIX/include \
-    MINIUPNPC_LIB_PATH=$PREFIX/lib \
-    CXXFLAGS="-DMAC_OSX -DMSG_NOSIGNAL=0 -I$PREFIX/include -mmacosx-version-min=11.0 -DBOOST_BIND_GLOBAL_PLACEHOLDERS" \
-    CFLAGS="-DMAC_OSX -DMSG_NOSIGNAL=0 -mmacosx-version-min=11.0" \
-    LDFLAGS="-L$PREFIX/lib -mmacosx-version-min=11.0" \
-    USE_UPNP=1 \
-    STATIC=all \
-    -j'"$jobs"'
-
-echo ">>> Stripping daemon..."
-$OSXCROSS/bin/${HOST}-strip '"$DAEMON_NAME"' 2>/dev/null || true
-
-echo ">>> Daemon build complete!"
-ls -lh '"$DAEMON_NAME"' 2>/dev/null || true
-file '"$DAEMON_NAME"' 2>/dev/null || true
-'
-
-        info "Starting macOS daemon build container: $daemon_container"
-        docker start -a "$daemon_container"
-
-        info "Extracting macOS daemon..."
-        if docker cp "$daemon_container:/build/$COIN_NAME/src/${DAEMON_NAME}" "$output_dir/daemon/${DAEMON_NAME}" 2>/dev/null; then
-            # Ensure daemon binary is executable (docker cp can lose +x)
-            chmod +x "$output_dir/daemon/${DAEMON_NAME}"
-            success "macOS daemon extracted to $output_dir/daemon/"
-            ls -lh "$output_dir/daemon/${DAEMON_NAME}"
+    if [[ "$target" == "qt" || "$target" == "both" ]]; then
+        info "Extracting Qt wallet (.app bundle)..."
+        rm -rf "$output_dir/Photon-Qt.app" 2>/dev/null || true
+        if docker cp "$container_name:/build/$COIN_NAME/Photon-Qt.app" "$output_dir/Photon-Qt.app" 2>/dev/null; then
+            find "$output_dir/Photon-Qt.app" -path "*/Contents/MacOS/*" -type f -exec chmod +x {} + 2>/dev/null || true
+            success "macOS app bundle extracted to $output_dir/"
         else
-            error "Could not find daemon binary in container"
-            docker exec "$daemon_container" find /build/$COIN_NAME/src -type f -executable -name "*d" 2>/dev/null || true
+            error "Could not find Photon-Qt.app in container"
+            docker exec "$container_name" find /build/$COIN_NAME -maxdepth 2 -name "*.app" -type d 2>/dev/null || true
         fi
-
-        write_build_info "$output_dir/daemon" "macos-cross-compile" "daemon" "Docker: $DOCKER_MACOS (osxcross)"
-        docker rm -f "$daemon_container" 2>/dev/null || true
-        docker run --rm -v "$tmpdir_daemon:/cleanup" alpine rm -rf /cleanup 2>/dev/null || rm -rf "$tmpdir_daemon" 2>/dev/null || true
+        docker cp "$container_name:/build/$COIN_NAME/src/qt/photon-qt" "$output_dir/photon-qt-${VERSION}" 2>/dev/null || true
     fi
+
+    build_note="Docker: $DOCKER_MACOS (depends + CONFIG_SITE)"
+    write_build_info "$output_dir" "macos" "$target" "$build_note"
+    CURRENT_OUTPUT_DIR="$output_dir"
+    GENERATE_CONFIG_AFTER_BUILD=0
+
+    docker rm -f "$container_name" 2>/dev/null || true
+    docker run --rm -v "$tmpdir:/cleanup" alpine rm -rf /cleanup 2>/dev/null || rm -rf "$tmpdir" 2>/dev/null || true
 
     echo ""
     echo "============================================"
-    echo "  BUILD SUCCESSFUL — macOS"
+    echo "  BUILD SUCCESSFUL  -  macOS"
     echo "  Output: $output_dir/"
     echo "============================================"
+    ls -lh "$output_dir"/* 2>/dev/null || true
 }
 
 # =============================================================================
-# APPIMAGE BUILD (Docker + Ubuntu 22.04)
+# APPIMAGE BUILD (Docker + autotools + AppDir packaging)
 # =============================================================================
 
 build_appimage() {
     local jobs="$1"
     local docker_mode="$2"
-    local container_name="appimage-${COIN_NAME}-build"
-    local output_dir="$OUTPUT_BASE/linux-appimage/qt"
+    local container_name="appimage-${COIN_NAME}-0152-build"
+    local output_dir
+    output_dir="$(appimage_output_dir)"
+    local appimage_path="$output_dir/${APPIMAGE_PUBLIC_NAME}"
 
     echo ""
     echo "============================================"
-    echo "  AppImage Build: $COIN_NAME_UPPER"
+    echo "  AppImage Build: $COIN_NAME_UPPER 0.15.2"
     echo "============================================"
     echo "  Image:  $DOCKER_APPIMAGE"
     echo ""
 
-    ensure_docker_image "$DOCKER_APPIMAGE" "$docker_mode" "Dockerfile.appimage-base"
+    ensure_docker_image "$DOCKER_APPIMAGE" "$docker_mode"
+    cleanup_legacy_output_root
+    rm -rf "$output_dir" "$OUTPUT_BASE/linux-appimage"
+    rm -f "$output_dir/${APPIMAGE_PUBLIC_NAME}.tar.gz"
     mkdir -p "$output_dir"
     docker rm -f "$container_name" 2>/dev/null || true
 
-    info "Building AppImage..."
-
-    # Copy local source to temp dir for volume-mount (uses already-patched files)
-    info "Copying local source to temp build dir..."
-    local tmpdir_appimage
-    tmpdir_appimage=$(mktemp -d)
-    cp -a "$SCRIPT_DIR/src" "$SCRIPT_DIR/share" "$tmpdir_appimage/"
-    cp -a "$SCRIPT_DIR"/*.pro "$tmpdir_appimage/" 2>/dev/null || true
+    # Copy source to temp dir
+    info "Copying source tree to temp build dir..."
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    copy_source_tree_to_tempdir "$tmpdir"
+    clean_stale_build_artifacts "$tmpdir"
+    fix_permissions "$tmpdir"
 
     docker create \
         --name "$container_name" \
-        -v "$tmpdir_appimage:/build/$COIN_NAME:rw" \
+        -v "$tmpdir:/build/$COIN_NAME:rw" \
         "$DOCKER_APPIMAGE" \
         /bin/bash -c '
 set -e
-
 cd /build/'"$COIN_NAME"'
 
-PRO_FILE=$(find . -maxdepth 1 -name "*.pro" ! -iname "*-OSX*" ! -iname "*OSX*" | head -1)
-
-echo ">>> Patching .pro file: $PRO_FILE"
-
-# Fix qmake syntax
-sed -i "s/USE_UPNP:=1/USE_UPNP=1/" "$PRO_FILE"
-
-# Remove hardcoded boost suffix
-sed -i "s/BOOST_LIB_SUFFIX=-mgw[^ ]*/BOOST_LIB_SUFFIX=/" "$PRO_FILE"
-sed -i "/-lboost_system-mgw[^ ]*/d" "$PRO_FILE"
-sed -i "/isEmpty(BOOST_LIB_SUFFIX)/,/^}/s/^/# /" "$PRO_FILE"
-
-# Add BOOST_BIND_GLOBAL_PLACEHOLDERS
-# Why: Boost 1.73+ deprecated global placeholders
-grep -q "BOOST_BIND_GLOBAL_PLACEHOLDERS" "$PRO_FILE" || \
-    sed -i "/^DEFINES/s/$/ BOOST_BIND_GLOBAL_PLACEHOLDERS/" "$PRO_FILE"
-
-# Remove pre-committed LevelDB config (let build_detect_platform generate it)
-# Why: Pre-committed config may target wrong platform
-rm -f src/leveldb/build_config.mk
-chmod +x src/leveldb/build_detect_platform 2>/dev/null || true
-
-# Add -ldl for static OpenSSL linking
-# Why: OpenSSL uses dlopen internally; needs -ldl on Linux
-grep -q "\-ldl" "$PRO_FILE" || echo "unix:!macx:LIBS += -ldl" >> "$PRO_FILE"
-
-# Add -lboost_chrono (needed on Ubuntu 22.04)
-# Why: Boost.Thread depends on Boost.Chrono; not auto-linked on newer Ubuntu
-grep -q "unix.*lboost_chrono" "$PRO_FILE" || echo "unix:!macx:LIBS += -lboost_chrono" >> "$PRO_FILE"
-
-# Boost 1.74+ removed get_io_service() from sockets/acceptors/streams
-# Why: Ubuntu 22.04 ships Boost 1.74; get_io_service() was removed, use get_executor()
-if [ -f src/bitcoinrpc.cpp ]; then
-    sed -i "s/resolver(stream\.get_io_service())/resolver(stream.get_executor())/g" src/bitcoinrpc.cpp
-    perl -i -pe '"'"'s/acceptor->get_io_service\(\)/static_cast<boost::asio::io_context\&>(acceptor->get_executor().context())/'"'"' src/bitcoinrpc.cpp
+# Patch sources for Qt 5.15+ and Boost 1.73+ compatibility
+echo ">>> Patching sources for modern Ubuntu compatibility..."
+if [ -f src/qt/trafficgraphwidget.cpp ]; then
+    grep -q "#include <QPainterPath>" src/qt/trafficgraphwidget.cpp || \
+        sed -i "1i #include <QPainterPath>" src/qt/trafficgraphwidget.cpp
 fi
+for f in $(grep -rl "boost::bind" src/ 2>/dev/null | grep "\.cpp$"); do
+    grep -q "boost/bind.hpp" "$f" || \
+        sed -i "1i #include <boost/bind.hpp>" "$f"
+done
 
-echo ">>> Building Qt wallet..."
-# Try qmake-qt5 first (Ubuntu 18.04), fall back to qmake (Ubuntu 22.04+)
-QMAKE=$(command -v qmake-qt5 2>/dev/null || command -v qmake 2>/dev/null || echo "/usr/lib/qt5/bin/qmake")
-echo "Using: $QMAKE"
-$QMAKE "$PRO_FILE" \
-    "USE_QRCODE=0" \
-    "USE_UPNP=1" \
-    "RELEASE=1"
+echo ">>> Building Qt wallet with autotools..."
+./autogen.sh
+./configure --disable-tests --disable-bench --enable-upnp-default \
+    CXXFLAGS="-O2 -DBOOST_BIND_GLOBAL_PLACEHOLDERS" LDFLAGS="-static-libstdc++"
+
+# Fix missing Qt translation files (Photon fork does not include them)
+if [ -f src/Makefile ]; then
+    sed -i "s/^QT_QM.*=.*/QT_QM =/" src/Makefile
+    sed -i "/bitcoin_.*\.qm/d" src/Makefile
+    sed -i "/locale\/.*\.qm/d" src/Makefile
+fi
+mkdir -p src/qt
+cat > src/qt/bitcoin_locale.qrc <<QRC_EOF
+<!DOCTYPE RCC><RCC version="1.0">
+<qresource prefix="/translations">
+</qresource>
+</RCC>
+QRC_EOF
 
 make -j'"$jobs"'
 
-QT_BIN=$(find . -name "'"$QT_NAME"'" -o -name "'"$COIN_NAME_UPPER"'-qt" | head -1)
-if [ -z "$QT_BIN" ]; then
-    QT_BIN=$(find release/ -type f -executable 2>/dev/null | head -1)
-fi
-
-if [ -z "$QT_BIN" ]; then
-    echo "ERROR: Could not find built Qt binary"
-    find . -type f -executable -name "*qt*" -o -name "*Qt*" 2>/dev/null
+QT_BIN="src/qt/'"$QT_NAME"'"
+if [ ! -f "$QT_BIN" ]; then
+    echo "ERROR: Could not find built Qt binary at $QT_BIN"
+    find src -name "*qt*" -type f 2>/dev/null
     exit 1
 fi
-
-strip "$QT_BIN" 2>/dev/null || true
+strip "$QT_BIN"
 
 echo ">>> Creating AppDir..."
 APPDIR=/build/appdir
@@ -1129,7 +2557,7 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/plugins" \
 
 cp "$QT_BIN" "$APPDIR/usr/bin/'"$QT_NAME"'"
 
-# Bundle Qt plugins (dynamic discovery like lib/appimage.sh)
+# Bundle Qt plugins
 QT_PLUGIN_DIR=""
 for p in /usr/lib/x86_64-linux-gnu/qt5/plugins /usr/lib/qt5/plugins /usr/lib64/qt5/plugins; do
     [ -d "$p" ] && QT_PLUGIN_DIR="$p" && break
@@ -1153,10 +2581,8 @@ for bin in "$APPDIR"/usr/bin/*; do
         lib_name=$(basename "$lib")
         case "$lib_name" in
             libc.so*|libdl.so*|libpthread.so*|libm.so*|librt.so*|libgcc_s.so*|libstdc++.so*|ld-linux*)
-                # Skip glibc/core runtime — always present on host
                 ;;
             libfontconfig.so*|libfreetype.so*)
-                # DO NOT bundle — old versions crash on variable-weight fonts
                 ;;
             *)
                 cp -nL "$lib" "$APPDIR/usr/lib/" 2>/dev/null || true
@@ -1189,14 +2615,13 @@ rm -f "$APPDIR/usr/lib/libatk-bridge-2.0.so"* "$APPDIR/usr/lib/libatspi.so"*
 rm -f "$APPDIR/usr/lib/libepoxy.so"*
 rm -f "$APPDIR/usr/plugins/platformthemes/libqgtk3.so" 2>/dev/null || true
 
-# Create qt.conf to tell Qt where to find plugins
+# Create qt.conf
 cat > "$APPDIR/usr/bin/qt.conf" << '\''QTCONF'\''
 [Paths]
 Plugins = ../plugins
 QTCONF
 
 # GSettings schema (cross-Ubuntu compatibility)
-# Why: antialiasing key moved to .deprecated schema in newer GNOME; apps crash without it
 SCHEMA_DIR="$APPDIR/usr/share/glib-2.0/schemas"
 cat > "$SCHEMA_DIR/org.gnome.settings-daemon.plugins.xsettings.gschema.xml" << '\''SCHEMA_EOF'\''
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1243,7 +2668,7 @@ cat > "$SCHEMA_DIR/org.gnome.settings-daemon.plugins.xsettings.gschema.xml" << '
 SCHEMA_EOF
 glib-compile-schemas "$SCHEMA_DIR" 2>/dev/null || echo "WARNING: glib-compile-schemas failed"
 
-# Minimal OpenSSL config (avoids host OpenSSL 3.0 conflicts)
+# Minimal OpenSSL config
 mkdir -p "$APPDIR/etc"
 cat > "$APPDIR/etc/openssl.cnf" << '\''SSL_EOF'\''
 openssl_conf = openssl_init
@@ -1255,12 +2680,12 @@ system_default = system_default_sect
 MinProtocol = TLSv1.2
 SSL_EOF
 
-# Desktop file (in AppDir root + usr/share/applications)
+# Desktop file
 cat > "$APPDIR/'"$COIN_NAME"'.desktop" << '\''DESKTOP_EOF'\''
 [Desktop Entry]
 Type=Application
 Name='"$COIN_NAME_UPPER"'
-Comment='"$COIN_NAME_UPPER"' Cryptocurrency Wallet
+Comment='"$COIN_NAME_UPPER"' 0.15.2 Cryptocurrency Wallet
 Exec='"$QT_NAME"'
 Icon='"$COIN_NAME"'
 Categories=Network;Finance;
@@ -1270,44 +2695,37 @@ DESKTOP_EOF
 mkdir -p "$APPDIR/usr/share/applications"
 cp "$APPDIR/'"$COIN_NAME"'.desktop" "$APPDIR/usr/share/applications/"
 
-# Icon (use existing or create placeholder)
+# Icon
 ICON_DIR="$APPDIR/usr/share/icons/hicolor/256x256/apps"
 mkdir -p "$ICON_DIR"
 if [ -f src/qt/res/icons/bitcoin.png ]; then
     cp src/qt/res/icons/bitcoin.png "$ICON_DIR/'"$COIN_NAME"'.png"
 else
-    # Minimal 1x1 placeholder PNG
     echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==" | base64 -d > "$ICON_DIR/'"$COIN_NAME"'.png"
 fi
-# Symlink in root (required by AppImage spec)
 ln -sf "usr/share/icons/hicolor/256x256/apps/'"$COIN_NAME"'.png" "$APPDIR/'"$COIN_NAME"'.png"
 
-# AppRun script with desktop integration
+# AppRun script
 cat > "$APPDIR/AppRun" << '\''APPRUN_EOF'\''
 #!/bin/bash
 APPDIR="$(dirname "$(readlink -f "$0")")"
 export LD_LIBRARY_PATH="$APPDIR/usr/lib:$LD_LIBRARY_PATH"
 export PATH="$APPDIR/usr/bin:$PATH"
 
-# Use bundled GSettings schemas
 export GSETTINGS_SCHEMA_DIR="$APPDIR/usr/share/glib-2.0/schemas"
 export GSETTINGS_BACKEND=memory
 export GIO_MODULE_DIR="$APPDIR/usr/lib/gio/modules"
 
-# Qt plugin paths
 if [ -d "$APPDIR/usr/plugins" ]; then
     export QT_PLUGIN_PATH="$APPDIR/usr/plugins"
 fi
 
-# Force X11 for older Qt builds; use Fusion style (GTK3 theme plugin removed)
 export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
 export QT_STYLE_OVERRIDE=Fusion
 export XDG_DATA_DIRS="$APPDIR/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
-
-# Prevent host OpenSSL 3.0 config from interfering
 export OPENSSL_CONF="$APPDIR/etc/openssl.cnf"
 
-# Desktop integration — register icon so GNOME dock shows coin logo
+# Desktop integration
 _ICON_NAME="'"$COIN_NAME"'"
 _QT_NAME="'"$QT_NAME"'"
 _WM_CLASS="'"$COIN_NAME_UPPER"'-Qt"
@@ -1315,7 +2733,7 @@ _COIN_NAME="'"$COIN_NAME_UPPER"'"
 _APPIMAGE_PATH="${APPIMAGE:-$0}"
 _ICON_SRC="$APPDIR/usr/share/icons/hicolor/256x256/apps/${_ICON_NAME}.png"
 _ICON_DST="$HOME/.local/share/icons/hicolor/256x256/apps/${_ICON_NAME}.png"
-_DESKTOP_DST="$HOME/.local/share/applications/${_QT_NAME}-appimage.desktop"
+_DESKTOP_DST="$HOME/.local/share/applications/${_QT_NAME}.desktop"
 
 if [ -f "$_ICON_SRC" ]; then
     mkdir -p "$(dirname "$_ICON_DST")" "$(dirname "$_DESKTOP_DST")" 2>/dev/null
@@ -1340,8 +2758,8 @@ chmod +x "$APPDIR/AppRun"
 echo ">>> Creating AppImage..."
 mkdir -p /build/output
 ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 appimagetool --no-appstream "$APPDIR" \
-    "/build/output/'"$COIN_NAME_UPPER"'-x86_64.AppImage"
-chmod +x "/build/output/'"$COIN_NAME_UPPER"'-x86_64.AppImage"
+    "/build/output/'"$COIN_NAME_UPPER"'-0.15.2-x86_64.AppImage"
+chmod +x "/build/output/'"$COIN_NAME_UPPER"'-0.15.2-x86_64.AppImage"
 
 echo ">>> AppImage build complete!"
 ls -lh /build/output/
@@ -1351,9 +2769,9 @@ ls -lh /build/output/
     docker start -a "$container_name"
 
     info "Extracting AppImage..."
-    if docker cp "$container_name:/build/output/${COIN_NAME_UPPER}-x86_64.AppImage" "$output_dir/${COIN_NAME_UPPER}-x86_64.AppImage" 2>/dev/null; then
+    if docker cp "$container_name:/build/output/${APPIMAGE_PUBLIC_NAME}" "$appimage_path" 2>/dev/null; then
         success "AppImage extracted to $output_dir/"
-        ls -lh "$output_dir/${COIN_NAME_UPPER}-x86_64.AppImage"
+        ls -lh "$appimage_path"
     else
         error "Could not find AppImage in container"
         docker rm -f "$container_name" 2>/dev/null || true
@@ -1361,282 +2779,211 @@ ls -lh /build/output/
     fi
 
     write_build_info "$output_dir" "appimage" "qt" "Docker: $DOCKER_APPIMAGE"
+    write_appimage_bundle_readme "$output_dir/README.md"
+    CURRENT_OUTPUT_DIR="$output_dir"
+    GENERATE_CONFIG_AFTER_BUILD=0
     docker rm -f "$container_name" 2>/dev/null || true
-
-    # Clean up temp dir (may contain root-owned build artifacts)
-    docker run --rm -v "$tmpdir_appimage:/cleanup" alpine rm -rf /cleanup 2>/dev/null || rm -rf "$tmpdir_appimage" 2>/dev/null || true
+    docker run --rm -v "$tmpdir:/cleanup" alpine rm -rf /cleanup 2>/dev/null || rm -rf "$tmpdir" 2>/dev/null || true
 
     echo ""
     echo "============================================"
-    echo "  BUILD SUCCESSFUL — AppImage"
-    echo "  Output: $output_dir/${COIN_NAME_UPPER}-x86_64.AppImage"
+    echo "  BUILD SUCCESSFUL  -  AppImage"
+    echo "  Output: $appimage_path"
+    echo "  Note:   Ubuntu 22.04.5 direct launch needs libfuse2"
+    echo "          Ubuntu 24.04.4 / 25.10 direct launch needs libfuse2t64"
+    echo "          Otherwise use --appimage-extract-and-run"
     echo "============================================"
 }
 
 # =============================================================================
-# NATIVE BUILD (Linux with Docker, or direct on Linux/macOS/Windows)
+# NATIVE BUILD (Docker  -  runs autotools inside container)
 # =============================================================================
 
 build_native_docker() {
     local target="$1"
     local jobs="$2"
     local docker_mode="$3"
-    local output_dir="$OUTPUT_BASE/native"
+    local ubuntu_ver=""
+    local final_output_dir=""
+    local install_packages=""
+    local daemon_stage="$OUTPUT_BASE/.linux-native-stage/daemon"
+    local qt_stage="$OUTPUT_BASE/.linux-native-stage/qt"
 
-    mkdir -p "$output_dir/daemon" "$output_dir/qt"
+    echo ""
+    echo "============================================"
+    echo "  Native Docker Build: $COIN_NAME_UPPER 0.15.2"
+    echo "============================================"
+    echo "  Image:  $DOCKER_NATIVE"
+    echo "  Target: $target"
+    echo ""
 
-    # Both daemon and Qt use native-base:18.04 (has build tools + Qt5 dev packages)
+    ensure_docker_image "$DOCKER_NATIVE" "$docker_mode"
+    ubuntu_ver="$(detect_native_docker_ubuntu_version)"
+    cleanup_legacy_output_root
+    rm -rf "$OUTPUT_BASE/native" "$OUTPUT_BASE/.linux-native-stage"
+    mkdir -p "$daemon_stage" "$qt_stage"
+    resolve_native_linux_packages "$target"
+    install_packages="$NATIVE_LINUX_ALL_DEPS_STR"
 
-    if [[ "$target" == "daemon" || "$target" == "both" ]]; then
-        local container_name="native-${COIN_NAME}-daemon"
+    # Copy source to temp dir. Use rsync with explicit excludes so stale local
+    # outputs and builder-only scratch trees do not leak into native container
+    # builds or fail due to root-owned files left behind by prior cross-builds.
+    info "Copying source tree to temp build dir..."
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    copy_source_tree_to_tempdir "$tmpdir"
+    clean_stale_build_artifacts "$tmpdir"
+    fix_permissions "$tmpdir"
 
-        echo ""
-        echo "============================================"
-        echo "  Native Daemon Build (Docker): $COIN_NAME_UPPER"
-        echo "============================================"
-        echo "  Image:  $DOCKER_NATIVE"
-        echo ""
+    local configure_extra=""
+    case "$target" in
+        daemon) configure_extra="--without-gui" ;;
+        qt)     configure_extra="--with-gui=qt5" ;;
+        both)   configure_extra="--with-gui=qt5" ;;
+    esac
 
-        ensure_docker_image "$DOCKER_NATIVE" "$docker_mode" "Dockerfile.native-base"
-        docker rm -f "$container_name" 2>/dev/null || true
+    local container_name="${NATIVE_CONTAINER_NAME:-native-${COIN_NAME}-0152-build}"
+    docker rm -f "$container_name" 2>/dev/null || true
 
-        # Mount local source into container (uses already-patched local files)
-        info "Copying local source to temp build dir..."
-        local tmpdir
-        tmpdir=$(mktemp -d)
-        cp -a "$SCRIPT_DIR/src" "$SCRIPT_DIR/share" "$tmpdir/"
-        cp -a "$SCRIPT_DIR"/*.pro "$tmpdir/" 2>/dev/null || true
-
-        docker run --rm --name "$container_name" \
-            -v "$tmpdir:/build/$COIN_NAME:rw" \
-            -v "$output_dir/daemon:/build/output/daemon:rw" \
-            "$DOCKER_NATIVE" \
-            /bin/bash -c '
+    docker create \
+        --name "$container_name" \
+        -v "$tmpdir:/build/$COIN_NAME:rw" \
+        "$DOCKER_NATIVE" \
+        /bin/bash -c '
 set -e
-
 cd /build/'"$COIN_NAME"'
 
-echo ">>> Applying Boost 1.65 compatibility patches (Ubuntu 18.04)..."
-
-# Boost 1.65 uses io_service, not io_context (added in Boost 1.66+)
-# Why: Ubuntu 18.04 ships Boost 1.65; code references newer API that doesnt exist
-for src_file in $(grep -rl "boost::asio::io_context" src/ 2>/dev/null); do
-    sed -i "s/boost::asio::io_context/boost::asio::io_service/g" "$src_file"
-    sed -i "s/get_executor()\.context()/get_io_service()/g" "$src_file"
+# Patch sources for Qt 5.15+ and Boost 1.73+ compatibility
+echo ">>> Patching sources for modern Ubuntu compatibility..."
+# QPainterPath split into separate header in Qt 5.15
+if [ -f src/qt/trafficgraphwidget.cpp ]; then
+    grep -q "#include <QPainterPath>" src/qt/trafficgraphwidget.cpp || \
+        sed -i "1i #include <QPainterPath>" src/qt/trafficgraphwidget.cpp
+fi
+# Boost 1.73+ moved bind placeholders (_1, _2, etc.) to boost::placeholders namespace
+# Files that use boost::bind but include it transitively need an explicit include
+# to trigger BOOST_BIND_GLOBAL_PLACEHOLDERS
+for f in $(grep -rl "boost::bind" src/ 2>/dev/null | grep "\.cpp$"); do
+    grep -q "boost/bind.hpp" "$f" || \
+        sed -i "1i #include <boost/bind.hpp>" "$f"
 done
 
-# Boost 1.65 uses copy_option not copy_options
-for src_file in $(grep -rl "copy_options::overwrite_existing" src/ 2>/dev/null); do
-    sed -i "s/copy_options::overwrite_existing/copy_option::overwrite_if_exists/g" "$src_file"
-done
+echo ">>> Running autogen.sh..."
+./autogen.sh
 
-echo ">>> Building daemon..."
-cd src
-rm -f leveldb/build_config.mk
-chmod +x leveldb/build_detect_platform 2>/dev/null || true
+echo ">>> Configuring..."
+./configure --disable-tests --disable-bench '"$configure_extra"' \
+    CXXFLAGS="-O2 -DBOOST_BIND_GLOBAL_PLACEHOLDERS"
 
-make -f makefile.unix \
-    USE_UPNP=1 \
-    CXXFLAGS="-DBOOST_BIND_GLOBAL_PLACEHOLDERS" \
-    -j'"$jobs"'
+# Fix missing Qt translation files (Photon fork does not include them)
+if [ -f src/Makefile ]; then
+    sed -i "s/^QT_QM.*=.*/QT_QM =/" src/Makefile
+    sed -i "/bitcoin_.*\.qm/d" src/Makefile
+    sed -i "/locale\/.*\.qm/d" src/Makefile
+fi
+mkdir -p src/qt
+cat > src/qt/bitcoin_locale.qrc <<QRC_EOF
+<!DOCTYPE RCC><RCC version="1.0">
+<qresource prefix="/translations">
+</qresource>
+</RCC>
+QRC_EOF
 
-strip '"$DAEMON_NAME"' 2>/dev/null || true
-echo ">>> Daemon build complete!"
-ls -lh '"$DAEMON_NAME"'
-cp '"$DAEMON_NAME"' /build/output/daemon/
+echo ">>> Building..."
+make -j'"$jobs"'
+
+echo ">>> Stripping binaries..."
+strip src/photond 2>/dev/null || true
+strip src/qt/photon-qt 2>/dev/null || true
+strip src/photon-cli 2>/dev/null || true
+strip src/photon-tx 2>/dev/null || true
+
+echo ">>> Build complete!"
+ls -lh src/photond src/qt/photon-qt src/photon-cli src/photon-tx 2>/dev/null || true
 '
 
-        if [[ -f "$output_dir/daemon/$DAEMON_NAME" ]]; then
-            success "Daemon built: $output_dir/daemon/$DAEMON_NAME"
-            ls -lh "$output_dir/daemon/$DAEMON_NAME"
-        else
-            warn "Could not find daemon binary"
-        fi
+    info "Starting build container: $container_name"
+    docker start -a "$container_name"
 
-        write_build_info "$output_dir/daemon" "native-docker" "daemon" "Docker: $DOCKER_NATIVE (Ubuntu 18.04)"
-        docker run --rm -v "$tmpdir:/cleanup" alpine rm -rf /cleanup 2>/dev/null || rm -rf "$tmpdir" 2>/dev/null || true
-
-        echo ""
-        echo "============================================"
-        echo "  BUILD SUCCESSFUL — Native Daemon (Docker)"
-        echo "  Output: $output_dir/daemon/"
-        echo "============================================"
+    # Extract binaries
+    if [[ "$target" == "daemon" || "$target" == "both" ]]; then
+        info "Extracting daemon binaries..."
+        docker cp "$container_name:/build/$COIN_NAME/src/photond" "$daemon_stage/photond-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/$COIN_NAME/src/photon-cli" "$daemon_stage/photon-cli-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/$COIN_NAME/src/photon-tx" "$daemon_stage/photon-tx-${VERSION}" 2>/dev/null || true
     fi
 
     if [[ "$target" == "qt" || "$target" == "both" ]]; then
-        local container_name="native-${COIN_NAME}-qt"
-
-        echo ""
-        echo "============================================"
-        echo "  Native Qt Build (Docker): $COIN_NAME_UPPER"
-        echo "============================================"
-        echo "  Image:  $DOCKER_NATIVE (Ubuntu 18.04)"
-        echo ""
-
-        ensure_docker_image "$DOCKER_NATIVE" "$docker_mode" "Dockerfile.native-base"
-        docker rm -f "$container_name" 2>/dev/null || true
-
-        # Mount local source into container (uses already-patched local files)
-        info "Copying local source to temp build dir..."
-        local tmpdir_qt
-        tmpdir_qt=$(mktemp -d)
-        cp -a "$SCRIPT_DIR/src" "$SCRIPT_DIR/share" "$tmpdir_qt/"
-        cp -a "$SCRIPT_DIR"/*.pro "$tmpdir_qt/" 2>/dev/null || true
-
-        docker run --rm --name "$container_name" \
-            -v "$tmpdir_qt:/build/$COIN_NAME:rw" \
-            -v "$output_dir/qt:/build/output/qt:rw" \
-            "$DOCKER_NATIVE" \
-            /bin/bash -c '
-set -e
-
-cd /build/'"$COIN_NAME"'
-
-echo ">>> Building Qt wallet..."
-PRO_FILE=$(find . -maxdepth 1 -name "*.pro" ! -iname "*-OSX*" | head -1)
-
-# Fix qmake syntax
-sed -i "s/USE_UPNP:=1/USE_UPNP=1/" "$PRO_FILE"
-
-# Remove Windows paths block
-# Why: Hardcoded C:/deps paths break Linux builds
-sed -i "/# Start of Windows Path/,/# End of Windows Path/d" "$PRO_FILE"
-
-# Remove hardcoded boost suffix
-# Why: Suffix like -mgw54-mt-s-x32-1_71 is MinGW-specific
-sed -i "s/BOOST_LIB_SUFFIX=-mgw[^ ]*/BOOST_LIB_SUFFIX=/" "$PRO_FILE"
-sed -i "/-lboost_system-mgw[^ ]*/d" "$PRO_FILE"
-sed -i "/isEmpty(BOOST_LIB_SUFFIX)/,/^}/s/^/# /" "$PRO_FILE"
-
-# Remove hardcoded Windows C: paths from include/lib paths
-sed -i "/^[A-Z_]*_PATH\s*=\s*[Cc]:/d" "$PRO_FILE"
-
-# Add BOOST_BIND_GLOBAL_PLACEHOLDERS
-# Why: Boost 1.73+ deprecated global placeholders
-grep -q "BOOST_BIND_GLOBAL_PLACEHOLDERS" "$PRO_FILE" || \
-    sed -i "/^DEFINES/s/$/ BOOST_BIND_GLOBAL_PLACEHOLDERS/" "$PRO_FILE"
-
-# Remove pre-committed LevelDB config
-# Why: Let build_detect_platform generate correct config for this platform
-rm -f src/leveldb/build_config.mk
-chmod +x src/leveldb/build_detect_platform 2>/dev/null || true
-
-# Add -ldl for static OpenSSL linking
-# Why: OpenSSL uses dlopen internally; needs -ldl on Linux
-grep -q "\-ldl" "$PRO_FILE" || echo "unix:!macx:LIBS += -ldl" >> "$PRO_FILE"
-
-# Add -lboost_chrono
-# Why: Boost.Thread depends on Boost.Chrono; not always auto-linked
-grep -q "unix.*lboost_chrono" "$PRO_FILE" || echo "unix:!macx:LIBS += -lboost_chrono" >> "$PRO_FILE"
-
-# Boost 1.65 uses io_service, not io_context (added in Boost 1.66+)
-# Why: Ubuntu 18.04 ships Boost 1.65; ensure source uses old API names
-for src_file in $(grep -rl "boost::asio::io_context" src/ 2>/dev/null); do
-    sed -i "s/boost::asio::io_context/boost::asio::io_service/g" "$src_file"
-    sed -i "s/get_executor()\.context()/get_io_service()/g" "$src_file"
-done
-
-# Boost 1.65 uses copy_option not copy_options
-for src_file in $(grep -rl "copy_options::overwrite_existing" src/ 2>/dev/null); do
-    sed -i "s/copy_options::overwrite_existing/copy_option::overwrite_if_exists/g" "$src_file"
-done
-
-echo ">>> Running qmake..."
-# Try qmake-qt5 first (Ubuntu 18.04), fall back to qmake (Ubuntu 22.04+)
-QMAKE=$(command -v qmake-qt5 2>/dev/null || command -v qmake 2>/dev/null || echo "/usr/lib/qt5/bin/qmake")
-echo "Using: $QMAKE"
-$QMAKE "$PRO_FILE" \
-    "USE_QRCODE=0" \
-    "USE_UPNP=1" \
-    "RELEASE=1"
-
-echo ">>> Building with make..."
-make -j'"$jobs"'
-
-QT_BIN=$(find release/ -type f -executable 2>/dev/null | head -1)
-[ -z "$QT_BIN" ] && QT_BIN=$(find . -maxdepth 1 -type f -executable \( -name "*qt*" -o -name "*Qt*" \) 2>/dev/null | head -1)
-strip "$QT_BIN" 2>/dev/null || true
-cp "$QT_BIN" /build/output/qt/'"$QT_NAME"'
-echo ">>> Qt wallet build complete!"
-ls -lh /build/output/qt/
-'
-
-        if [[ -f "$output_dir/qt/$QT_NAME" ]]; then
-            success "Qt wallet built: $output_dir/qt/$QT_NAME"
-            ls -lh "$output_dir/qt/$QT_NAME"
-        else
-            warn "Could not find Qt binary"
-        fi
-
-        write_build_info "$output_dir/qt" "native-docker" "qt" "Docker: $DOCKER_NATIVE (Ubuntu 18.04)"
-        docker run --rm -v "$tmpdir_qt:/cleanup" alpine rm -rf /cleanup 2>/dev/null || rm -rf "$tmpdir_qt" 2>/dev/null || true
-
-        echo ""
-        echo "============================================"
-        echo "  BUILD SUCCESSFUL — Native Qt (Docker)"
-        echo "  Output: $output_dir/qt/"
-        echo "============================================"
+        info "Extracting Qt wallet..."
+        docker cp "$container_name:/build/$COIN_NAME/src/qt/photon-qt" "$qt_stage/photon-qt-${VERSION}" 2>/dev/null || true
     fi
+
+    finalize_linux_native_output \
+        "$ubuntu_ver" \
+        "$target" \
+        "$daemon_stage/photond-${VERSION}" \
+        "$daemon_stage/photon-cli-${VERSION}" \
+        "$daemon_stage/photon-tx-${VERSION}" \
+        "$qt_stage/photon-qt-${VERSION}" \
+        "$install_packages"
+
+    final_output_dir="$(linux_output_dir "$ubuntu_ver")"
+
+    docker rm -f "$container_name" 2>/dev/null || true
+    docker run --rm -v "$tmpdir:/cleanup" alpine rm -rf /cleanup 2>/dev/null || rm -rf "$tmpdir" 2>/dev/null || true
+    rm -rf "$OUTPUT_BASE/.linux-native-stage"
+
+    echo ""
+    echo "============================================"
+    echo "  BUILD SUCCESSFUL  -  Native (Docker)"
+    echo "  Output: $final_output_dir/"
+    echo "============================================"
 }
+
+# =============================================================================
+# NATIVE BUILD (Direct  -  no Docker)
+# =============================================================================
 
 build_native_direct() {
     local target="$1"
     local jobs="$2"
-    local host_os
-    host_os=$(detect_os)
-    local os_version
-    os_version=$(detect_os_version "$host_os")
 
-    echo ""
-    echo "============================================"
-    echo "  Native Build (Direct): $COIN_NAME_UPPER"
-    echo "============================================"
-    echo "  OS:     $os_version"
-    echo "  Target: $target"
-    echo ""
+    local os
+    os=$(detect_os)
 
-    case "$host_os" in
-        linux)
-            build_native_linux_direct "$target" "$jobs" "$os_version"
-            ;;
-        macos)
-            build_native_macos "$target" "$jobs" "$os_version"
-            ;;
-        windows)
-            build_native_windows "$target" "$jobs" "$os_version"
-            ;;
+    case "$os" in
+        linux)   build_native_linux_direct "$target" "$jobs" ;;
+        macos)   build_native_macos "$target" "$jobs" ;;
+        windows) build_native_windows "$target" "$jobs" ;;
     esac
 }
 
 build_native_linux_direct() {
     local target="$1"
     local jobs="$2"
-    local os_version="$3"
-    local output_dir="$OUTPUT_BASE/native"
+    local final_output_dir=""
+    local install_packages=""
 
-    # Install build + runtime dependencies
-    # Build deps: compilers, headers, static libs for compiling
-    # Runtime deps: shared libs, MIME database, XCB platform plugin for Qt display
-    local build_deps="build-essential libssl-dev libboost-all-dev libminiupnpc-dev"
-    local qt_build_deps="qt5-qmake qtbase5-dev qttools5-dev-tools"
-    local qt_runtime_deps="shared-mime-info libqt5widgets5 libqt5gui5 libqt5network5 libqt5dbus5"
-    local bdb_deps=""
+    echo ""
+    echo "============================================"
+    echo "  Native Linux Build: $COIN_NAME_UPPER 0.15.2"
+    echo "============================================"
+    echo ""
 
-    # BDB 4.8 is preferred but not always available; fall back to 5.3
-    if apt-cache show libdb4.8-dev &>/dev/null 2>&1; then
-        bdb_deps="libdb4.8-dev libdb4.8++-dev"
-    elif apt-cache show libdb5.3-dev &>/dev/null 2>&1; then
-        bdb_deps="libdb5.3-dev libdb5.3++-dev"
+    # Detect Ubuntu version
+    local ubuntu_ver=""
+    if [[ -f /etc/os-release ]]; then
+        ubuntu_ver=$(. /etc/os-release && echo "$VERSION_ID")
     fi
+    info "Detected OS: Ubuntu ${ubuntu_ver:-unknown}"
 
-    local all_deps="$build_deps $bdb_deps"
-    if [[ "$target" == "qt" || "$target" == "both" ]]; then
-        all_deps="$all_deps $qt_build_deps $qt_runtime_deps"
-    fi
+    resolve_native_linux_packages "$target"
+    install_packages="$NATIVE_LINUX_ALL_DEPS_STR"
 
+    # Check and auto-install missing packages
     info "Checking and installing dependencies..."
     local missing_pkgs=()
-    for pkg in $all_deps; do
+    for pkg in "${NATIVE_LINUX_ALL_DEPS[@]}"; do
         dpkg -s "$pkg" &>/dev/null 2>&1 || missing_pkgs+=("$pkg")
     done
 
@@ -1644,412 +2991,371 @@ build_native_linux_direct() {
         info "Installing missing packages: ${missing_pkgs[*]}"
         sudo apt-get update -qq
         sudo apt-get install -y -qq "${missing_pkgs[@]}"
+    else
+        info "All dependencies already installed"
     fi
 
-    mkdir -p "$output_dir/daemon" "$output_dir/qt"
+    cleanup_legacy_output_root
+    rm -rf "$OUTPUT_BASE/native"
+    local linux_bdb_prefix=""
+    linux_bdb_prefix="$(ensure_repo_bdb48 linux "linux-$(uname -m)" "$jobs")" || return 1
 
-    # Detect Boost version and apply compat patches if needed
-    local boost_ver
-    boost_ver=$(dpkg -s libboost-dev 2>/dev/null | grep '^Version:' | grep -oP '\d+\.\d+' | head -1)
-    if [[ -n "$boost_ver" ]]; then
-        local boost_major boost_minor
-        boost_major=$(echo "$boost_ver" | cut -d. -f1)
-        boost_minor=$(echo "$boost_ver" | cut -d. -f2)
-        if [[ "$boost_major" -eq 1 && "$boost_minor" -lt 66 ]]; then
-            info "Boost $boost_ver detected — applying Boost 1.65 compatibility patches..."
-            # Boost 1.65 uses io_service, not io_context (added in Boost 1.66+)
-            for src_file in $(grep -rl "boost::asio::io_context" "$SCRIPT_DIR/src/" 2>/dev/null); do
-                sed -i "s/boost::asio::io_context/boost::asio::io_service/g" "$src_file"
-                sed -i "s/get_executor()\.context()/get_io_service()/g" "$src_file"
-            done
-            # Boost 1.65 uses copy_option not copy_options
-            for src_file in $(grep -rl "copy_options::overwrite_existing" "$SCRIPT_DIR/src/" 2>/dev/null); do
-                sed -i "s/copy_options::overwrite_existing/copy_option::overwrite_if_exists/g" "$src_file"
-            done
-        fi
+    local configure_extra=""
+    case "$target" in
+        daemon) configure_extra="--without-gui" ;;
+        qt)     configure_extra="--with-gui=qt5" ;;
+        both)   configure_extra="--with-gui=qt5" ;;
+    esac
+
+    cd "$SCRIPT_DIR"
+
+    # Patch sources for Qt 5.15+ and Boost 1.73+ compatibility
+    if [[ -f src/qt/trafficgraphwidget.cpp ]]; then
+        grep -q "#include <QPainterPath>" src/qt/trafficgraphwidget.cpp || \
+            sedi '1i #include <QPainterPath>' src/qt/trafficgraphwidget.cpp
     fi
+
+    # MSYS2 Boost 1.90 provides Boost.System as a header-only component,
+    # so the legacy AX_BOOST_SYSTEM macro must not hard-fail on a missing
+    # libboost_system archive.
+    if [[ -n "${MSYSTEM:-}" ]] && ! compgen -G "/mingw64/lib/libboost_system*" >/dev/null && [[ -f build-aux/m4/ax_boost_system.m4 ]]; then
+        info "MSYS2 Boost.System is header-only  -  patching AX_BOOST_SYSTEM"
+        perl -0pi -e 's/AC_MSG_ERROR\(Could not find a version of the boost_system library!\)/BOOST_SYSTEM_LIB=""; AC_SUBST(BOOST_SYSTEM_LIB); link_system="yes"/g' build-aux/m4/ax_boost_system.m4
+    fi
+
+    info "Running autogen.sh..."
+    ./autogen.sh
+
+    # Modern MSYS2 ships Boost.System as a header-only component, so there is
+    # no libboost_system*.a to locate even though Boost itself is present.
+    if [[ -n "${MSYSTEM:-}" ]] && ! compgen -G "/mingw64/lib/libboost_system*" >/dev/null && [[ -f build-aux/m4/ax_boost_system.m4 ]]; then
+        info "MSYS2 Boost.System is header-only  -  patching AX_BOOST_SYSTEM for no-library mode"
+        perl -0pi -e 's/AC_MSG_ERROR\(Could not find a version of the boost_system library!\)/BOOST_SYSTEM_LIB=""; AC_SUBST(BOOST_SYSTEM_LIB); link_system="yes"/g' build-aux/m4/ax_boost_system.m4
+    fi
+
+    info "Configuring..."
+    ./configure --disable-tests --disable-bench $configure_extra \
+        BDB_CFLAGS="-I$linux_bdb_prefix/include" \
+        BDB_LIBS="-L$linux_bdb_prefix/lib -ldb_cxx-4.8 -ldb-4.8" \
+        CXXFLAGS="-O2 -DBOOST_BIND_GLOBAL_PLACEHOLDERS"
+
+    # Fix missing Qt translation files (Photon fork does not include them)
+    if [[ -f src/Makefile ]]; then
+        sedi 's/^QT_QM.*=.*/QT_QM =/' src/Makefile
+        sedi '/bitcoin_.*\.qm/d' src/Makefile
+        sedi '/locale\/.*\.qm/d' src/Makefile
+    fi
+    mkdir -p src/qt
+    cat > src/qt/bitcoin_locale.qrc <<'QRC_EOF'
+<!DOCTYPE RCC><RCC version="1.0">
+<qresource prefix="/translations">
+</qresource>
+</RCC>
+QRC_EOF
+
+    info "Building with $jobs jobs..."
+    make -j"$jobs"
 
     if [[ "$target" == "daemon" || "$target" == "both" ]]; then
-        info "Building daemon..."
-        cd "$SCRIPT_DIR/src"
-
-        # Remove pre-committed LevelDB config
-        rm -f leveldb/build_config.mk
-        chmod +x leveldb/build_detect_platform 2>/dev/null || true
-
-        make -f makefile.unix \
-            USE_UPNP=1 \
-            CXXFLAGS="-DBOOST_BIND_GLOBAL_PLACEHOLDERS" \
-            -j"$jobs"
-
-        strip "$DAEMON_NAME" 2>/dev/null || true
-        cp "$DAEMON_NAME" "$output_dir/daemon/"
-        success "Daemon: $output_dir/daemon/$DAEMON_NAME"
-        ls -lh "$output_dir/daemon/$DAEMON_NAME"
-        cd "$SCRIPT_DIR"
+        info "Relinking native Linux daemon tools against Berkeley DB 4.8..."
+        relink_native_linux_target "photond" "$SCRIPT_DIR/src/photond"
+        relink_native_linux_target "photon-cli" "$SCRIPT_DIR/src/photon-cli"
+        relink_native_linux_target "photon-tx" "$SCRIPT_DIR/src/photon-tx"
     fi
 
     if [[ "$target" == "qt" || "$target" == "both" ]]; then
-        info "Building Qt wallet..."
-        cd "$SCRIPT_DIR"
-
-        local pro_file
-        pro_file=$(find . -maxdepth 1 -name "*.pro" ! -iname "*-OSX*" | head -1)
-        apply_pro_patches "$pro_file"
-
-        rm -f src/leveldb/build_config.mk
-        chmod +x src/leveldb/build_detect_platform 2>/dev/null || true
-
-        grep -q "\-ldl" "$pro_file" || echo "unix:!macx:LIBS += -ldl" >> "$pro_file"
-
-        # Find qmake: try qmake-qt5, then /usr/lib/qt5/bin/qmake, then system qmake
-        # Why: /usr/bin/qmake is often qtchooser which fails without QT_SELECT=qt5
-        local qmake_bin
-        if command -v qmake-qt5 &>/dev/null; then
-            qmake_bin="qmake-qt5"
-        elif [[ -x /usr/lib/qt5/bin/qmake ]]; then
-            qmake_bin="/usr/lib/qt5/bin/qmake"
-        else
-            qmake_bin="qmake"
-            export QT_SELECT=qt5
-        fi
-
-        "$qmake_bin" "$pro_file" \
-            "USE_QRCODE=0" \
-            "USE_UPNP=1" \
-            "RELEASE=1"
-
-        make -j"$jobs"
-
-        local qt_bin=""
-        qt_bin=$(find release/ -type f -executable 2>/dev/null | head -1 || true)
-        [[ -z "$qt_bin" ]] && qt_bin=$(find . -maxdepth 1 -name "*qt*" -type f -executable 2>/dev/null | head -1 || true)
-        if [[ -n "$qt_bin" ]]; then
-            strip "$qt_bin" 2>/dev/null || true
-            cp "$qt_bin" "$output_dir/qt/$QT_NAME"
-            success "Qt wallet: $output_dir/qt/$QT_NAME"
-            ls -lh "$output_dir/qt/$QT_NAME"
-        else
-            error "Qt binary not found after build"
-            exit 1
-        fi
+        info "Relinking native Linux Qt wallet against Berkeley DB 4.8..."
+        relink_native_linux_target "qt/photon-qt" "$SCRIPT_DIR/src/qt/photon-qt"
     fi
 
-    write_build_info "$output_dir" "native-linux" "$target" "$os_version"
+    if [[ "$target" == "daemon" || "$target" == "both" ]]; then
+        strip src/photond src/photon-cli src/photon-tx 2>/dev/null || true
+    fi
 
-    # Install .desktop launcher + icon for Activities search (Linux only, Qt builds)
-    if [[ "$target" == "qt" || "$target" == "both" ]] && [[ -f "$output_dir/qt/$QT_NAME" ]]; then
-        info "Installing desktop launcher and icon..."
-        local icon_dir="$HOME/.local/share/icons/hicolor/256x256/apps"
-        local app_dir="$HOME/.local/share/applications"
-        mkdir -p "$icon_dir" "$app_dir"
+    if [[ "$target" == "qt" || "$target" == "both" ]]; then
+        strip src/qt/photon-qt 2>/dev/null || true
+    fi
 
-        # Copy coin icon from source tree
-        local icon_src=""
-        for search in "$SCRIPT_DIR/src/qt/res/icons/bitcoin.png" \
-                      "$SCRIPT_DIR/src/qt/res/icons/${COIN_NAME}.png"; do
-            [[ -f "$search" ]] && icon_src="$search" && break
-        done
-        if [[ -n "$icon_src" ]]; then
-            if command -v convert &>/dev/null; then
-                convert "$icon_src" -resize 256x256 -background none -gravity center -extent 256x256 "$icon_dir/${QT_NAME}.png"
-            else
-                cp "$icon_src" "$icon_dir/${QT_NAME}.png"
-            fi
-        fi
+    finalize_linux_native_output \
+        "$ubuntu_ver" \
+        "$target" \
+        "$SCRIPT_DIR/src/photond" \
+        "$SCRIPT_DIR/src/photon-cli" \
+        "$SCRIPT_DIR/src/photon-tx" \
+        "$SCRIPT_DIR/src/qt/photon-qt" \
+        "$install_packages"
 
-        # Create .desktop file
-        local qt_path
-        qt_path="$(readlink -f "$output_dir/qt/$QT_NAME")"
-        cat > "$app_dir/${QT_NAME}.desktop" << DESK_EOF
-[Desktop Entry]
-Type=Application
-Name=$COIN_NAME_UPPER Qt
-Comment=$COIN_NAME_UPPER Cryptocurrency Wallet
-Exec=$qt_path
-Icon=${QT_NAME}
-Terminal=false
-Categories=Finance;Network;
-StartupWMClass=${QT_NAME}
-DESK_EOF
-        chmod +x "$app_dir/${QT_NAME}.desktop"
-        if [[ ! -f "$HOME/.local/share/icons/hicolor/index.theme" ]]; then
-            cat > "$HOME/.local/share/icons/hicolor/index.theme" << 'THEME_EOF'
-[Icon Theme]
-Name=Hicolor
-Comment=Fallback Icon Theme
-Directories=256x256/apps
+    final_output_dir="$(linux_output_dir "$ubuntu_ver")"
 
-[256x256/apps]
-Size=256
-Context=Applications
-Type=Fixed
-THEME_EOF
-        fi
-        gtk-update-icon-cache -f "$HOME/.local/share/icons/hicolor/" 2>/dev/null || true
-        update-desktop-database "$app_dir" 2>/dev/null || true
-        success "Desktop launcher installed — search '$COIN_NAME_UPPER' in Activities"
+    if [[ "$target" == "qt" || "$target" == "both" ]]; then
+        install_linux_desktop_launcher "$final_output_dir"
     fi
 
     echo ""
     echo "============================================"
-    echo "  BUILD SUCCESSFUL — Native Linux"
-    echo "  OS:     $os_version"
-    echo "  Output: $output_dir/"
+    echo "  BUILD SUCCESSFUL  -  Native Linux"
+    echo "  Output: $final_output_dir/"
     echo "============================================"
 }
 
 build_native_macos() {
     local target="$1"
     local jobs="$2"
-    local os_version="$3"
-    local output_dir="$OUTPUT_BASE/macos"
-
-    # Check for Homebrew
-    if ! command -v brew &>/dev/null; then
-        error "Homebrew not found. Install from https://brew.sh"
-        exit 1
-    fi
-
-    local brew_prefix
-    brew_prefix=$(brew --prefix)
-
-    # Check dependencies (openssl@3 is the current Homebrew formula)
-    local missing=()
-    for pkg in openssl@3 boost@1.85 miniupnpc berkeley-db@4 qt@5; do
-        brew list "$pkg" &>/dev/null || missing+=("$pkg")
-    done
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        error "Missing Homebrew packages: ${missing[*]}"
-        echo "Install with: brew install ${missing[*]}"
-        exit 1
-    fi
-
-    local openssl_prefix boost_prefix bdb_prefix qt5_prefix miniupnpc_prefix
-    openssl_prefix=$(brew --prefix openssl@3)
-    boost_prefix=$(brew --prefix boost@1.85)
-    bdb_prefix=$(brew --prefix berkeley-db@4)
-    qt5_prefix=$(brew --prefix qt@5)
-    miniupnpc_prefix=$(brew --prefix miniupnpc)
-
-    mkdir -p "$output_dir/daemon" "$output_dir/qt"
-
-    # Apply macOS-specific source patches
-    info "Applying macOS source patches..."
-
-    # Filesystem namespace disambiguation
-    # Why: macOS clang exposes std::filesystem which conflicts with boost::filesystem
-    local fs_files="$SCRIPT_DIR/src/bitcoinrpc.cpp $SCRIPT_DIR/src/util.cpp $SCRIPT_DIR/src/walletdb.cpp $SCRIPT_DIR/src/init.cpp $SCRIPT_DIR/src/wallet.cpp $SCRIPT_DIR/src/db.cpp $SCRIPT_DIR/src/net.cpp $SCRIPT_DIR/src/main.cpp"
-    for f in $fs_files; do
-        if [[ -f "$f" ]]; then
-            # Replace all filesystem:: with boost::filesystem::, then fix any double-qualification
-            # (no \b — not supported by macOS BSD sed)
-            sedi 's/filesystem::/boost::filesystem::/g' "$f"
-            sedi 's/boost::boost::filesystem::/boost::filesystem::/g' "$f"
-        fi
-    done
-
-    # miniupnpc 2.2+ API change: UPNP_GetValidIGD now requires wanaddr params
-    # Why: Homebrew miniupnpc 2.2+ changed the function signature to include WAN address output
-    if [[ -f "$SCRIPT_DIR/src/net.cpp" ]]; then
-        if grep -q 'UPNP_GetValidIGD(devlist, &urls, &data, lanaddr, sizeof(lanaddr));' "$SCRIPT_DIR/src/net.cpp"; then
-            perl -i -pe 's/r = UPNP_GetValidIGD\(devlist, &urls, &data, lanaddr, sizeof\(lanaddr\)\);/char wanaddr[64] = ""; r = UPNP_GetValidIGD(devlist, \&urls, \&data, lanaddr, sizeof(lanaddr), wanaddr, sizeof(wanaddr));/' "$SCRIPT_DIR/src/net.cpp"
-        fi
-    fi
-
-    # Boost 1.80+ removed get_io_service() from sockets/acceptors/streams
-    # Why: Deprecated in Boost 1.70, removed in 1.80; use get_executor() instead
-    if [[ -f "$SCRIPT_DIR/src/bitcoinrpc.cpp" ]]; then
-        # resolver construction: stream.get_io_service() → stream.get_executor()
-        sedi 's/resolver(stream\.get_io_service())/resolver(stream.get_executor())/g' "$SCRIPT_DIR/src/bitcoinrpc.cpp"
-        # AcceptedConnectionImpl: acceptor->get_io_service() → io_context from executor
-        perl -i -pe 's/acceptor->get_io_service\(\)/static_cast<boost::asio::io_context\&>(acceptor->get_executor().context())/' "$SCRIPT_DIR/src/bitcoinrpc.cpp"
-    fi
-
-    # Boost 1.74+ renamed copy_option to copy_options, overwrite_if_exists to overwrite_existing
-    # Why: Old Boost filesystem v2 API removed; v3 uses copy_options enum class
-    for src_file in $(grep -rl "copy_option::overwrite_if_exists" "$SCRIPT_DIR/src/" 2>/dev/null); do
-        sedi 's/copy_option::overwrite_if_exists/copy_options::overwrite_existing/g' "$src_file"
-    done
-
-    # Patch makefile.unix for macOS compatibility
-    info "Patching makefile.unix for macOS..."
-    if [[ -f "$SCRIPT_DIR/src/makefile.unix" ]]; then
-        # Use perl for reliable makefile patching (line-by-line)
-        perl -i -pe '
-            # Compile .c files with CC instead of CXX
-            # Why: blake.c uses C void* implicit conversion which clang++ rejects
-            s/\$\(CXX\) -c \$\(xCXXFLAGS\) -fpermissive/\$(CC) -c -O2 -pthread -fPIC \$(DEFS) \$(CXXFLAGS)/;
-            # Remove lines with -Wl,-B flags (macOS ld64 does not support them)
-            if (/^\s*-Wl,-B\$\(LMODE2?\)/) { $_ = ""; next }
-            # Remove -l dl line (macOS has dlopen in libSystem)
-            if (/^\s*-l dl/) { $_ = ""; next }
-            # Remove -Wl,-z,relro -Wl,-z,now (Linux-only hardening)
-            s/-Wl,-z,relro -Wl,-z,now//;
-        ' "$SCRIPT_DIR/src/makefile.unix"
-    fi
-
-    if [[ "$target" == "daemon" || "$target" == "both" ]]; then
-        info "Building daemon..."
-        cd "$SCRIPT_DIR/src"
-
-        rm -f leveldb/build_config.mk
-
-        # Write macOS LevelDB config
-        cat > leveldb/build_config.mk <<LEVELDB_EOF
-SOURCES=db/builder.cc db/c.cc db/db_impl.cc db/db_iter.cc db/dbformat.cc db/dumpfile.cc db/filename.cc db/log_reader.cc db/log_writer.cc db/memtable.cc db/repair.cc db/table_cache.cc db/version_edit.cc db/version_set.cc db/write_batch.cc table/block.cc table/block_builder.cc table/filter_block.cc table/format.cc table/iterator.cc table/merger.cc table/table.cc table/table_builder.cc table/two_level_iterator.cc util/arena.cc util/bloom.cc util/cache.cc util/coding.cc util/comparator.cc util/crc32c.cc util/env.cc util/env_posix.cc util/filter_policy.cc util/hash.cc util/histogram.cc util/logging.cc util/options.cc util/status.cc port/port_posix.cc
-MEMENV_SOURCES=helpers/memenv/memenv.cc
-CC=clang
-CXX=clang++
-PLATFORM=OS_MACOSX
-PLATFORM_LDFLAGS=
-PLATFORM_LIBS=
-PLATFORM_CCFLAGS= -DOS_MACOSX -DLEVELDB_PLATFORM_POSIX
-PLATFORM_CXXFLAGS= -DOS_MACOSX -DLEVELDB_PLATFORM_POSIX
-LEVELDB_EOF
-
-        # Detect if boost_thread needs -mt suffix (Homebrew boost@1.85 has thread-mt only)
-        local boost_suffix=""
-        if [[ ! -f "$boost_prefix/lib/libboost_thread.dylib" && -f "$boost_prefix/lib/libboost_thread-mt.dylib" ]]; then
-            boost_suffix="-mt"
-        fi
-
-        make -f makefile.unix \
-            USE_UPNP=1 \
-            BOOST_LIB_SUFFIX="$boost_suffix" \
-            CXXFLAGS="-DBOOST_BIND_GLOBAL_PLACEHOLDERS -I$boost_prefix/include -I$openssl_prefix/include -I$bdb_prefix/include -I$miniupnpc_prefix/include" \
-            LDFLAGS="-L$boost_prefix/lib -L$openssl_prefix/lib -L$bdb_prefix/lib -L$miniupnpc_prefix/lib" \
-            -j"$jobs"
-
-        strip "$DAEMON_NAME" 2>/dev/null || true
-        cp "$DAEMON_NAME" "$output_dir/daemon/"
-
-        success "Daemon: $output_dir/daemon/$DAEMON_NAME"
-        ls -lh "$output_dir/daemon/$DAEMON_NAME"
-        cd "$SCRIPT_DIR"
-    fi
-
-    if [[ "$target" == "qt" || "$target" == "both" ]]; then
-        info "Building Qt wallet..."
-        cd "$SCRIPT_DIR"
-
-        local pro_file
-        pro_file=$(find . -maxdepth 1 -name "*.pro" ! -iname "*-OSX*" | head -1)
-
-        # Apply patches with Homebrew prefix
-        apply_pro_patches "$pro_file"
-
-        # Remove ancient macOS 10.5/i386 deployment target (uses SDK that doesn't exist)
-        # Why: .pro targets macOS 10.5 32-bit with /Developer/SDKs/ path; modern macOS uses current SDK
-        sedi '/mmacosx-version-min=10\.5/d' "$pro_file"
-        # Remove 32-bit arch flag (i386 is dead on macOS 10.15+)
-        sedi '/arch i386/d' "$pro_file"
-
-        # Set Homebrew-specific dependency paths (individual prefixes since keg-only pkgs differ)
-        sedi "s|BOOST_INCLUDE_PATH=.*|BOOST_INCLUDE_PATH=$boost_prefix/include|" "$pro_file"
-        sedi "s|BOOST_LIB_PATH=.*|BOOST_LIB_PATH=$boost_prefix/lib|" "$pro_file"
-        sedi "s|BDB_INCLUDE_PATH=.*|BDB_INCLUDE_PATH=$bdb_prefix/include|" "$pro_file"
-        sedi "s|BDB_LIB_PATH=.*|BDB_LIB_PATH=$bdb_prefix/lib|" "$pro_file"
-        sedi "s|OPENSSL_INCLUDE_PATH=.*|OPENSSL_INCLUDE_PATH=$openssl_prefix/include|" "$pro_file"
-        sedi "s|OPENSSL_LIB_PATH=.*|OPENSSL_LIB_PATH=$openssl_prefix/lib|" "$pro_file"
-        sedi "s|MINIUPNPC_INCLUDE_PATH=.*|MINIUPNPC_INCLUDE_PATH=$miniupnpc_prefix/include|" "$pro_file"
-        sedi "s|MINIUPNPC_LIB_PATH=.*|MINIUPNPC_LIB_PATH=$miniupnpc_prefix/lib|" "$pro_file"
-
-        rm -f src/leveldb/build_config.mk
-
-        # Write macOS LevelDB config (same as daemon build)
-        cat > src/leveldb/build_config.mk <<LEVELDB_QT_EOF
-SOURCES=db/builder.cc db/c.cc db/db_impl.cc db/db_iter.cc db/dbformat.cc db/dumpfile.cc db/filename.cc db/log_reader.cc db/log_writer.cc db/memtable.cc db/repair.cc db/table_cache.cc db/version_edit.cc db/version_set.cc db/write_batch.cc table/block.cc table/block_builder.cc table/filter_block.cc table/format.cc table/iterator.cc table/merger.cc table/table.cc table/table_builder.cc table/two_level_iterator.cc util/arena.cc util/bloom.cc util/cache.cc util/coding.cc util/comparator.cc util/crc32c.cc util/env.cc util/env_posix.cc util/filter_policy.cc util/hash.cc util/histogram.cc util/logging.cc util/options.cc util/status.cc port/port_posix.cc
-MEMENV_SOURCES=helpers/memenv/memenv.cc
-CC=clang
-CXX=clang++
-PLATFORM=OS_MACOSX
-PLATFORM_LDFLAGS=
-PLATFORM_LIBS=
-PLATFORM_CCFLAGS= -DOS_MACOSX -DLEVELDB_PLATFORM_POSIX
-PLATFORM_CXXFLAGS= -DOS_MACOSX -DLEVELDB_PLATFORM_POSIX
-LEVELDB_QT_EOF
-
-        # Regenerate bitcoin.icns from bitcoin.png to ensure correct coin branding
-        # Why: The repo may contain stale Bitcoin icns from upstream; must match bitcoin.png
-        # Uses macOS native sips + iconutil (same approach as lib/macos.sh convert-icon.sh)
-        local icons_dir="$SCRIPT_DIR/src/qt/res/icons"
-        if [[ -f "$icons_dir/bitcoin.png" ]]; then
-            info "Regenerating macOS icon from bitcoin.png..."
-            rm -f "$icons_dir/bitcoin.icns"
-            local iconset_dir
-            iconset_dir=$(mktemp -d)/coin.iconset
-            mkdir -p "$iconset_dir"
-            for size in 16 32 128 256 512; do
-                sips -z $size $size "$icons_dir/bitcoin.png" --out "$iconset_dir/icon_${size}x${size}.png" >/dev/null 2>&1
-                local size2=$((size * 2))
-                sips -z $size2 $size2 "$icons_dir/bitcoin.png" --out "$iconset_dir/icon_${size}x${size}@2x.png" >/dev/null 2>&1
-            done
-            iconutil -c icns "$iconset_dir" -o "$icons_dir/bitcoin.icns" 2>/dev/null || true
-            if [[ -f "$icons_dir/bitcoin.icns" ]]; then
-                success "Icon generated: $(ls -lh "$icons_dir/bitcoin.icns" | awk '{print $5}')"
-            else
-                warn "iconutil failed; using existing bitcoin.icns from repo"
-            fi
-            rm -rf "$(dirname "$iconset_dir")"
-        fi
-
-        # Detect if boost libs need -mt suffix (Homebrew boost@1.85 has thread-mt only)
-        local boost_suffix=""
-        if [[ ! -f "$boost_prefix/lib/libboost_thread.dylib" && -f "$boost_prefix/lib/libboost_thread-mt.dylib" ]]; then
-            boost_suffix="-mt"
-        fi
-
-        "$qt5_prefix/bin/qmake" "$pro_file" \
-            "USE_QRCODE=0" \
-            "USE_UPNP=1" \
-            "RELEASE=1" \
-            "BOOST_LIB_SUFFIX=$boost_suffix" \
-            "BOOST_THREAD_LIB_SUFFIX=$boost_suffix"
-
-        make -j"$jobs"
-
-        local qt_bin
-        qt_bin=$(find . -name "${COIN_NAME_UPPER}-Qt.app" -type d 2>/dev/null | head -1)
-        if [[ -n "$qt_bin" ]]; then
-            # Fix Info.plist: update executable name, identifiers, and version
-            # Why: The .pro file generates Info.plist with Bitcoin-Qt defaults;
-            # macOS looks for the CFBundleExecutable binary name and fails if wrong
-            local app_plist="$qt_bin/Contents/Info.plist"
-            if [[ -f "$app_plist" ]]; then
-                sedi "s|<string>Bitcoin-Qt</string>|<string>${COIN_NAME_UPPER}-Qt</string>|g" "$app_plist"
-                sedi "s|org.bitcoinfoundation.Bitcoin-Qt|org.${COIN_NAME}.${COIN_NAME_UPPER}-Qt|g" "$app_plist"
-                sedi "s|org.bitcoinfoundation.BitcoinPayment|org.${COIN_NAME}.${COIN_NAME_UPPER}Payment|g" "$app_plist"
-                sedi "s|<string>bitcoin</string>|<string>${COIN_NAME}</string>|g" "$app_plist"
-                sedi 's|\$VERSION|0.8.6|g' "$app_plist"
-                sedi 's|\$YEAR|2024|g' "$app_plist"
-                sedi "s|The Bitcoin developers|The ${COIN_NAME_UPPER} developers|g" "$app_plist"
-            fi
-
-            # Strip the binary
-            strip "$qt_bin/Contents/MacOS/${COIN_NAME_UPPER}-Qt" 2>/dev/null || true
-
-            # Ad-hoc code sign (required by macOS Catalina+)
-            # Why: Unsigned .app bundles get "damaged or incomplete" error from Gatekeeper
-            codesign --force --deep --sign - "$qt_bin" 2>/dev/null || true
-
-            cp -r "$qt_bin" "$output_dir/qt/"
-            success "Qt wallet: $output_dir/qt/"
-        else
-            qt_bin=$(find release/ -type f -executable 2>/dev/null | head -1 || true)
-            [[ -z "$qt_bin" ]] && qt_bin=$(find . -maxdepth 1 -name "*qt*" -type f -executable 2>/dev/null | head -1 || true)
-            strip "$qt_bin" 2>/dev/null || true
-            cp "$qt_bin" "$output_dir/qt/$QT_NAME"
-            success "Qt wallet: $output_dir/qt/$QT_NAME"
-        fi
-    fi
-
-    write_build_info "$output_dir" "native-macos" "$target" "$os_version"
+    local output_dir
+    output_dir="$(macos_output_dir)"
+    local app_name="Photon-Qt.app"
+    local native_dep_root="$SCRIPT_DIR/.native-macos-deps"
+    local protobuf_version="3.12.4"
+    local protobuf_archive="$native_dep_root/src/protobuf-cpp-${protobuf_version}.tar.gz"
+    local protobuf_src_dir="$native_dep_root/src/protobuf-${protobuf_version}"
+    local protobuf_prefix=""
 
     echo ""
     echo "============================================"
-    echo "  BUILD SUCCESSFUL — Native macOS"
-    echo "  OS:     $os_version"
+    echo "  Native macOS Build: $COIN_NAME_UPPER 0.15.2"
+    echo "============================================"
+    echo ""
+
+    ensure_macos_homebrew
+
+    # Check/install dependencies
+    local deps=(openssl@3 boost miniupnpc berkeley-db@4 qt@5 libevent pkg-config automake autoconf libtool curl)
+    for dep in "${deps[@]}"; do
+        if ! brew list "$dep" &>/dev/null; then
+            info "Installing $dep..."
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install "$dep"
+        fi
+    done
+
+    local openssl_prefix boost_prefix bdb_prefix qt5_prefix libevent_prefix miniupnpc_prefix
+    openssl_prefix=$(brew --prefix openssl@3)
+    boost_prefix=$(brew --prefix boost)
+    bdb_prefix=$(brew --prefix berkeley-db@4)
+    qt5_prefix=$(brew --prefix qt@5)
+    libevent_prefix=$(brew --prefix libevent)
+    miniupnpc_prefix=$(brew --prefix miniupnpc)
+
+    verify_bdb48_prefix "$bdb_prefix" "Native macOS Homebrew Berkeley DB" || return 1
+
+    cleanup_legacy_output_root
+    cleanup_target_output_dir "$output_dir"
+    mkdir -p "$native_dep_root/src"
+
+    local configure_extra=""
+    case "$target" in
+        daemon) configure_extra="--without-gui" ;;
+        qt)     configure_extra="--with-gui=qt5" ;;
+        both)   configure_extra="--with-gui=qt5" ;;
+    esac
+
+    if [[ "$target" == "qt" || "$target" == "both" ]]; then
+        protobuf_prefix="$native_dep_root/protobuf-${protobuf_version}"
+        if [[ ! -x "$protobuf_prefix/bin/protoc" || ! -f "$protobuf_prefix/lib/pkgconfig/protobuf.pc" ]]; then
+            info "Building protobuf ${protobuf_version} for native macOS compatibility..."
+            rm -rf "$protobuf_src_dir" "$protobuf_prefix"
+            curl -L "https://github.com/protocolbuffers/protobuf/releases/download/v${protobuf_version}/protobuf-cpp-${protobuf_version}.tar.gz" -o "$protobuf_archive"
+            tar -xzf "$protobuf_archive" -C "$native_dep_root/src"
+            (
+                cd "$protobuf_src_dir"
+                ./configure --prefix="$protobuf_prefix" --disable-shared --enable-static \
+                    CFLAGS="-O2" CXXFLAGS="-O2 -std=c++11"
+                make -j"$jobs"
+                make install
+            )
+        fi
+        export PATH="$qt5_prefix/bin:$protobuf_prefix/bin:$PATH"
+    else
+        export PATH="$qt5_prefix/bin:$PATH"
+    fi
+
+    local pkg_config_path="$openssl_prefix/lib/pkgconfig:$qt5_prefix/lib/pkgconfig:$libevent_prefix/lib/pkgconfig:$miniupnpc_prefix/lib/pkgconfig"
+    local cppflags="-I$bdb_prefix/include -I$boost_prefix/include -I$openssl_prefix/include -I$miniupnpc_prefix/include -I$libevent_prefix/include"
+    local ldflags="-L$bdb_prefix/lib -L$boost_prefix/lib -L$openssl_prefix/lib -L$miniupnpc_prefix/lib -L$libevent_prefix/lib"
+    local protoc_bin=""
+    configure_extra="$configure_extra --with-boost=$boost_prefix --with-boost-libdir=$boost_prefix/lib"
+    if [[ -n "$protobuf_prefix" ]]; then
+        pkg_config_path="$protobuf_prefix/lib/pkgconfig:$pkg_config_path"
+        cppflags="$cppflags -I$protobuf_prefix/include"
+        ldflags="$ldflags -L$protobuf_prefix/lib"
+        protoc_bin="$protobuf_prefix/bin/protoc"
+    fi
+
+    cd "$SCRIPT_DIR"
+
+    # Modern Homebrew Boost can ship Boost.System as a header-only component,
+    # so the legacy AX_BOOST_SYSTEM macro must not hard-fail on a missing
+    # libboost_system library during native macOS configure.
+    if ! compgen -G "$boost_prefix/lib/libboost_system*" >/dev/null && [[ -f build-aux/m4/ax_boost_system.m4 ]]; then
+        info "Homebrew Boost.System is header-only  -  patching AX_BOOST_SYSTEM"
+        python3 - <<'PY'
+from pathlib import Path
+
+replacement_old = """            if test "x$ax_lib" = "x"; then
+                AC_MSG_ERROR(Could not find a version of the boost_system library!)
+            fi
+\t\t\tif test "x$link_system" = "xno"; then
+\t\t\t\tAC_MSG_ERROR(Could not link against $ax_lib !)
+\t\t\tfi"""
+
+replacement_new = """            if test "x$ax_lib" = "x"; then
+                BOOST_SYSTEM_LIB=""
+                AC_SUBST(BOOST_SYSTEM_LIB)
+                link_system="yes"
+            fi
+\t\t\tif test "x$link_system" = "xno" && test "x$ax_lib" != "x"; then
+\t\t\t\tAC_MSG_ERROR(Could not link against $ax_lib !)
+\t\t\tfi"""
+
+p = Path("build-aux/m4/ax_boost_system.m4")
+text = p.read_text()
+if replacement_old in text:
+    p.write_text(text.replace(replacement_old, replacement_new))
+PY
+    fi
+
+    info "Running autogen.sh..."
+    ./autogen.sh
+
+    # Patch sources for Qt 5.15+ and Boost 1.73+ compatibility
+    if [[ -f src/qt/trafficgraphwidget.cpp ]]; then
+        grep -q "#include <QPainterPath>" src/qt/trafficgraphwidget.cpp || \
+            sedi '1i #include <QPainterPath>' src/qt/trafficgraphwidget.cpp
+    fi
+    while IFS= read -r boost_bind_file; do
+        grep -q "boost/bind.hpp" "$boost_bind_file" || \
+            perl -0pi -e 's/\A/#include <boost\/bind.hpp>\n/' "$boost_bind_file"
+    done < <(grep -rl "boost::bind" src/ 2>/dev/null | grep '\.cpp$' || true)
+
+    info "Configuring..."
+    ./configure --disable-tests --disable-bench --disable-zmq $configure_extra \
+        CXXFLAGS="-O2 -DBOOST_BIND_GLOBAL_PLACEHOLDERS -Wno-enum-constexpr-conversion" \
+        OBJCXXFLAGS="-O2 -Wno-enum-constexpr-conversion" \
+        PKG_CONFIG_PATH="$pkg_config_path" \
+        CPPFLAGS="$cppflags" \
+        LDFLAGS="$ldflags" \
+        BDB_CFLAGS="-I$bdb_prefix/include" \
+        BDB_LIBS="-L$bdb_prefix/lib -ldb_cxx-4.8 -ldb-4.8" \
+        PROTOC="$protoc_bin"
+
+    # Fix missing Qt translation files (Photon fork does not include them)
+    if [[ -f src/Makefile ]]; then
+        python3 - <<PY
+from pathlib import Path
+
+p = Path("src/Makefile")
+text = p.read_text()
+text = text.replace("-I/usr/local/include", "-I${boost_prefix}/include")
+p.write_text(text)
+PY
+        sedi 's/^QT_QM.*=.*/QT_QM =/' src/Makefile
+        sedi '/bitcoin_.*\.qm/d' src/Makefile
+        sedi '/locale\/.*\.qm/d' src/Makefile
+    fi
+    if [[ "$target" == "qt" || "$target" == "both" ]] && command -v protoc &>/dev/null && [[ -f src/qt/paymentrequest.proto ]]; then
+        info "Regenerating paymentrequest protobuf sources for native macOS protobuf..."
+        (
+            cd src/qt
+            protoc --cpp_out=. paymentrequest.proto
+        )
+    fi
+    mkdir -p src/qt
+    cat > src/qt/bitcoin_locale.qrc <<'QRC_EOF'
+<!DOCTYPE RCC><RCC version="1.0">
+<qresource prefix="/translations">
+</qresource>
+</RCC>
+QRC_EOF
+
+    info "Building with $jobs jobs..."
+    make -j"$jobs"
+
+    if [[ "$target" == "daemon" || "$target" == "both" ]]; then
+        strip src/photond src/photon-cli src/photon-tx 2>/dev/null || true
+        cp src/photond "$output_dir/photond-${VERSION}"
+        cp src/photon-cli "$output_dir/photon-cli-${VERSION}"
+        cp src/photon-tx "$output_dir/photon-tx-${VERSION}"
+        success "Daemon binaries in $output_dir/"
+    fi
+
+    if [[ "$target" == "qt" || "$target" == "both" ]]; then
+        strip src/qt/photon-qt 2>/dev/null || true
+        cp src/qt/photon-qt "$output_dir/photon-qt-${VERSION}"
+
+        rm -rf "$output_dir/$app_name"
+        mkdir -p "$output_dir/$app_name/Contents/MacOS" "$output_dir/$app_name/Contents/Resources"
+        cp src/qt/photon-qt "$output_dir/$app_name/Contents/MacOS/Photon-Qt"
+
+        local icons_dir="$SCRIPT_DIR/src/qt/res/icons"
+        if [[ -f "$icons_dir/bitcoin.png" ]] && command -v sips &>/dev/null && command -v iconutil &>/dev/null; then
+            info "Generating macOS icon from bitcoin.png..."
+            local iconset_root iconset_dir size size2
+            iconset_root=$(mktemp -d)
+            iconset_dir="$iconset_root/${COIN_NAME}.iconset"
+            mkdir -p "$iconset_dir"
+            for size in 16 32 128 256 512; do
+                sips -z "$size" "$size" "$icons_dir/bitcoin.png" --out "$iconset_dir/icon_${size}x${size}.png" >/dev/null 2>&1 || true
+                size2=$((size * 2))
+                sips -z "$size2" "$size2" "$icons_dir/bitcoin.png" --out "$iconset_dir/icon_${size}x${size}@2x.png" >/dev/null 2>&1 || true
+            done
+            iconutil -c icns "$iconset_dir" -o "$output_dir/$app_name/Contents/Resources/${COIN_NAME}.icns" 2>/dev/null || true
+            rm -rf "$iconset_root"
+        fi
+
+        cat > "$output_dir/$app_name/Contents/Info.plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>Photon-Qt</string>
+    <key>CFBundleIdentifier</key>
+    <string>org.photon.Photon-Qt</string>
+    <key>CFBundleName</key>
+    <string>Photon-Qt</string>
+    <key>CFBundleDisplayName</key>
+    <string>Photon Core</string>
+    <key>CFBundleVersion</key>
+    <string>${VERSION}</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${VERSION}</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleIconFile</key>
+    <string>photon</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
+PLIST_EOF
+
+        if [[ -x "$qt5_prefix/bin/macdeployqt" ]]; then
+            info "Bundling Qt frameworks with macdeployqt..."
+            "$qt5_prefix/bin/macdeployqt" "$output_dir/$app_name" >/dev/null 2>&1 || warn "macdeployqt failed; leaving native bundle unmodified"
+        fi
+
+        info "Resolving transitive dylib dependencies for native macOS bundle..."
+        bundle_macos_transitive_dylibs \
+            "$output_dir/$app_name" \
+            "$boost_prefix/lib" \
+            "$openssl_prefix/lib" \
+            "$bdb_prefix/lib" \
+            "$libevent_prefix/lib" \
+            "$miniupnpc_prefix/lib" \
+            "$qt5_prefix/lib"
+
+        codesign --force --deep --sign - "$output_dir/$app_name" 2>/dev/null || true
+        success "Qt wallet in $output_dir/"
+    fi
+
+    write_build_info "$output_dir" "native-macos" "$target" "$(detect_os_version macos)"
+    CURRENT_OUTPUT_DIR="$output_dir"
+    GENERATE_CONFIG_AFTER_BUILD=1
+
+    echo ""
+    echo "============================================"
+    echo "  BUILD SUCCESSFUL  -  Native macOS"
     echo "  Output: $output_dir/"
     echo "============================================"
 }
@@ -2057,182 +3363,366 @@ LEVELDB_QT_EOF
 build_native_windows() {
     local target="$1"
     local jobs="$2"
-    local os_version="${3:-Windows}"
-    local output_dir="$OUTPUT_BASE/native"
+    local output_dir
+    output_dir="$(windows_output_dir)"
+    local native_windows_debug_symbols="${NATIVE_WINDOWS_DEBUG_SYMBOLS:-0}"
+    local mingw_triplet=""
+    local native_dep_root="$SCRIPT_DIR/.native-windows-deps"
+    local protobuf_version="3.12.4"
+    local protobuf_archive="$native_dep_root/src/protobuf-cpp-${protobuf_version}.tar.gz"
+    local protobuf_src_dir="$native_dep_root/src/protobuf-${protobuf_version}"
+    local protobuf_prefix="$native_dep_root/protobuf-${protobuf_version}"
+    local msys_packages=(
+        autoconf
+        automake
+        libtool
+        make
+        pkgconf
+        curl
+        git
+        patch
+        perl
+        tar
+        zip
+        unzip
+    )
+    local mingw_packages=(
+        mingw-w64-x86_64-gcc
+        mingw-w64-x86_64-pkgconf
+        mingw-w64-x86_64-boost
+        mingw-w64-x86_64-openssl
+        mingw-w64-x86_64-libevent
+        mingw-w64-x86_64-miniupnpc
+    )
+    local windows_cflags="-O2"
+    local windows_cxxflags="-O2 -DBOOST_BIND_GLOBAL_PLACEHOLDERS"
 
     echo ""
     echo "============================================"
-    echo "  Native Windows Build: $COIN_NAME_UPPER"
+    echo "  Native Windows Build: $COIN_NAME_UPPER 0.15.2"
     echo "============================================"
-    echo "  Target: $target"
     echo ""
 
-    # Must be running inside MSYS2 MinGW64
-    if [[ -z "${MSYSTEM:-}" ]] || [[ "$MSYSTEM" != "MINGW64" ]]; then
-        error "Native Windows builds must run from the MSYS2 MinGW64 shell."
-        echo ""
-        echo "  Open 'MSYS2 MinGW64' from the Start menu and re-run this script."
-        echo ""
-        exit 1
+    if [[ "$native_windows_debug_symbols" == "1" ]]; then
+        # Keep native Windows release builds fast and stripped by default, but
+        # allow a symbolized debug build when we need to map a crash offset.
+        windows_cflags="-g -O0"
+        windows_cxxflags="-g -O0 -DBOOST_BIND_GLOBAL_PLACEHOLDERS"
+        info "Native Windows debug symbols enabled (no strip, -g -O0)."
     fi
 
-    # Check key dependencies
-    local missing=()
-    command -v gcc &>/dev/null || missing+=("mingw-w64-x86_64-gcc")
-    command -v qmake &>/dev/null || missing+=("mingw-w64-x86_64-qt5-base")
-    command -v make &>/dev/null || missing+=("make")
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        error "Missing packages: ${missing[*]}"
-        echo ""
-        echo "  Install with:"
-        echo "    pacman -S --needed ${missing[*]}"
-        echo ""
-        exit 1
-    fi
-
-    mkdir -p "$output_dir/qt" "$output_dir/daemon"
-
-    # Helper: in-place edit using perl (sed -i fails on NTFS due to file locking)
-    edit() { perl -i -pe "$1" "$2"; }
-
-    local MINGW_PREFIX="/mingw64"
+    ensure_windows_icon_assets
+    ensure_windows_native_shell "$target" "$jobs"
 
     if [[ "$target" == "qt" || "$target" == "both" ]]; then
-        info "Building Qt wallet..."
-
-        # Clean previous build
-        make clean 2>/dev/null || true
-        make distclean 2>/dev/null || true
-        rm -f Makefile "${QT_NAME}.exe" release/*.exe 2>/dev/null || true
-        mkdir -p build release
-
-        # Fix line endings on key files
-        perl -i -pe 's/\r$//' *.pro src/util.h src/compat.h src/bitcoinrpc.cpp 2>/dev/null || true
-
-        local PRO_FILE
-        PRO_FILE=$(ls -1 *.pro 2>/dev/null | head -1)
-        if [[ -z "$PRO_FILE" ]]; then
-            error "No .pro file found"
-            exit 1
-        fi
-        info "Patching $PRO_FILE..."
-
-        # Fix qmake assignment syntax
-        edit 's/USE_UPNP:=1/USE_UPNP=1/' "$PRO_FILE"
-
-        # Fix lrelease path
-        edit 's|\\\\lrelease\.exe|/lrelease|' "$PRO_FILE"
-
-        # Set boost lib suffix to -mt (MSYS2 MinGW64 uses -mt suffix)
-        edit 's/^BOOST_LIB_SUFFIX=.*/BOOST_LIB_SUFFIX=-mt/' "$PRO_FILE"
-
-        # Comment out isEmpty(BOOST_LIB_SUFFIX) auto-detection block
-        perl -i -0pe 's/(isEmpty\(BOOST_LIB_SUFFIX\).*?\n\})/# $1/s' "$PRO_FILE" 2>/dev/null || true
-
-        # Remove hardcoded boost lib references
-        edit '/-lboost_system-mgw/d' "$PRO_FILE"
-
-        # Add BOOST_BIND_GLOBAL_PLACEHOLDERS
-        grep -q 'BOOST_BIND_GLOBAL_PLACEHOLDERS' "$PRO_FILE" || \
-            edit 's/^(DEFINES.*)/$1 BOOST_BIND_GLOBAL_PLACEHOLDERS/' "$PRO_FILE"
-
-        # Point dependency paths to MinGW sysroot
-        edit "s|BOOST_INCLUDE_PATH=.*|BOOST_INCLUDE_PATH=$MINGW_PREFIX/include|" "$PRO_FILE"
-        edit "s|BOOST_LIB_PATH=.*|BOOST_LIB_PATH=$MINGW_PREFIX/lib|" "$PRO_FILE"
-        edit "s|BDB_INCLUDE_PATH=.*|BDB_INCLUDE_PATH=$MINGW_PREFIX/include|" "$PRO_FILE"
-        edit "s|BDB_LIB_PATH=.*|BDB_LIB_PATH=$MINGW_PREFIX/lib|" "$PRO_FILE"
-        edit "s|OPENSSL_INCLUDE_PATH=.*|OPENSSL_INCLUDE_PATH=$MINGW_PREFIX/include|" "$PRO_FILE"
-        edit "s|OPENSSL_LIB_PATH=.*|OPENSSL_LIB_PATH=$MINGW_PREFIX/lib|" "$PRO_FILE"
-        edit "s|MINIUPNPC_INCLUDE_PATH=.*|MINIUPNPC_INCLUDE_PATH=$MINGW_PREFIX/include|" "$PRO_FILE"
-        edit "s|MINIUPNPC_LIB_PATH=.*|MINIUPNPC_LIB_PATH=$MINGW_PREFIX/lib|" "$PRO_FILE"
-
-        # Add -lcrypt32 for OpenSSL 3.x Windows Certificate Store support
-        grep -q 'lcrypt32' "$PRO_FILE" || echo 'win32:LIBS += -lcrypt32' >> "$PRO_FILE"
-
-        # Fix pid_t redefinition — mingw-w64 already provides pid_t
-        info "Fixing pid_t and SOCKET conflicts..."
-        edit 's/typedef int pid_t;/\/\/ pid_t provided by mingw-w64/' src/util.h
-
-        # Fix SOCKET typedef — wrap in #ifndef so it only applies on non-Windows
-        perl -i -pe 's/^typedef u_int SOCKET;/#ifndef WIN32\ntypedef u_int SOCKET;\n#endif/' src/compat.h
-
-        # Fix Boost 1.80+ get_io_service() removal
-        info "Fixing Boost get_io_service()..."
-        if [[ -f src/bitcoinrpc.cpp ]]; then
-            edit 's/resolver\(stream\.get_io_service\(\)\)/resolver(stream.get_executor())/' src/bitcoinrpc.cpp
-            perl -i -pe 's/acceptor->get_io_service\(\)/static_cast<boost::asio::io_context\&>(acceptor->get_executor().context())/' src/bitcoinrpc.cpp
-        fi
-
-        # Write Windows LevelDB config for MinGW
-        info "Writing LevelDB build_config.mk"
-        cat > src/leveldb/build_config.mk << 'LEVELDB_EOF'
-SOURCES=db/builder.cc db/c.cc db/db_impl.cc db/db_iter.cc db/dbformat.cc db/filename.cc db/log_reader.cc db/log_writer.cc db/memtable.cc db/repair.cc db/table_cache.cc db/version_edit.cc db/version_set.cc db/write_batch.cc table/block.cc table/block_builder.cc table/filter_block.cc table/format.cc table/iterator.cc table/merger.cc table/table.cc table/table_builder.cc table/two_level_iterator.cc util/arena.cc util/bloom.cc util/cache.cc util/coding.cc util/comparator.cc util/crc32c.cc util/env.cc util/env_win.cc util/filter_policy.cc util/hash.cc util/histogram.cc util/options.cc util/status.cc port/port_win.cc
-MEMENV_SOURCES=helpers/memenv/memenv.cc
-CC=gcc
-CXX=g++
-PLATFORM=OS_WINDOWS
-PLATFORM_LDFLAGS=-lshlwapi
-PLATFORM_LIBS=
-PLATFORM_CCFLAGS= -fno-builtin-memcmp -D_REENTRANT -DOS_WIN -DLEVELDB_PLATFORM_WINDOWS -DWINVER=0x0500 -D__USE_MINGW_ANSI_STDIO=1 -DLEVELDB_IS_BIG_ENDIAN=0
-PLATFORM_CXXFLAGS= -fno-builtin-memcmp -D_REENTRANT -DOS_WIN -DLEVELDB_PLATFORM_WINDOWS -DWINVER=0x0500 -D__USE_MINGW_ANSI_STDIO=1 -DLEVELDB_IS_BIG_ENDIAN=0
-LEVELDB_EOF
-
-        # Build with shared Qt5 (MSYS2 qt5-static has UCRT/MSVCRT mismatch)
-        # For a single-file static exe, use Docker cross-compile: ./build.sh --windows --qt --pull-docker
-        info "Running qmake..."
-        qmake "$PRO_FILE" "USE_UPNP=1" "USE_QRCODE=0" "RELEASE=1"
-
-        info "Building (jobs: $jobs)..."
-        make -j"$jobs"
-
-        # Find and strip the exe
-        local QT_BIN
-        QT_BIN=$(find release/ -name "*.exe" 2>/dev/null | head -1)
-        [[ -z "$QT_BIN" ]] && QT_BIN=$(find . -maxdepth 1 -name "*.exe" 2>/dev/null | head -1)
-        if [[ -z "$QT_BIN" ]]; then
-            error "No .exe found after build"
-            exit 1
-        fi
-        strip "$QT_BIN" 2>/dev/null || true
-
-        # Bundle exe + all MinGW DLL deps into output folder
-        mkdir -p "$output_dir/qt/platforms"
-        cp "$QT_BIN" "$output_dir/qt/${QT_NAME}.exe"
-
-        info "Bundling DLL dependencies..."
-        ldd "$QT_BIN" | grep mingw64 | awk '{print $3}' | while read dll; do
-            cp "$dll" "$output_dir/qt/" && echo "  Bundled $(basename "$dll")"
-        done
-
-        # Qt platform plugin (required for Windows rendering)
-        cp /mingw64/share/qt5/plugins/platforms/qwindows.dll "$output_dir/qt/platforms/"
-
-        success "Qt wallet: $output_dir/qt/${QT_NAME}.exe"
-        ls -lh "$output_dir/qt/${QT_NAME}.exe"
+        mingw_packages+=(
+            mingw-w64-x86_64-qt5-base
+            mingw-w64-x86_64-qt5-tools
+            mingw-w64-x86_64-qrencode
+        )
     fi
+
+    info "Installing required MSYS2 packages..."
+    pacman -S --needed --noconfirm "${msys_packages[@]}" "${mingw_packages[@]}"
+
+    # MSYS2 names the Qt5 tools with a -qt5 suffix.
+    if ! command -v qmake &>/dev/null && command -v qmake-qt5 &>/dev/null; then
+        ln -sf "$(command -v qmake-qt5)" /mingw64/bin/qmake 2>/dev/null || true
+    fi
+    if ! command -v lrelease &>/dev/null && command -v lrelease-qt5 &>/dev/null; then
+        ln -sf "$(command -v lrelease-qt5)" /mingw64/bin/lrelease 2>/dev/null || true
+    fi
+    if ! command -v moc &>/dev/null && [[ -x /mingw64/bin/moc.exe ]]; then
+        ln -sf /mingw64/bin/moc.exe /mingw64/bin/moc 2>/dev/null || true
+    fi
+    if ! command -v uic &>/dev/null && [[ -x /mingw64/bin/uic.exe ]]; then
+        ln -sf /mingw64/bin/uic.exe /mingw64/bin/uic 2>/dev/null || true
+    fi
+    if ! command -v rcc &>/dev/null && [[ -x /mingw64/bin/rcc.exe ]]; then
+        ln -sf /mingw64/bin/rcc.exe /mingw64/bin/rcc 2>/dev/null || true
+    fi
+
+    local missing_tools=()
+    local tool
+    for tool in curl pkg-config make gcc g++ strip ldd autoconf automake libtoolize; do
+        command -v "$tool" &>/dev/null || missing_tools+=("$tool")
+    done
+    if [[ "$target" == "qt" || "$target" == "both" ]]; then
+        command -v qmake &>/dev/null || command -v qmake-qt5 &>/dev/null || missing_tools+=("qmake")
+        command -v lrelease &>/dev/null || command -v lrelease-qt5 &>/dev/null || missing_tools+=("lrelease")
+    fi
+    if [[ ${#missing_tools[@]} -gt 0 ]]; then
+        error "Missing required MSYS2 tools after install: ${missing_tools[*]}"
+        exit 1
+    fi
+
+    cleanup_legacy_output_root
+    cleanup_target_output_dir "$output_dir"
+    mingw_triplet="$(gcc -dumpmachine)"
+    local windows_bdb_prefix=""
+    windows_bdb_prefix="$(ensure_repo_bdb48 mingw "mingw64-$(printf '%s' "$mingw_triplet" | tr '/' '_')" "$jobs")" || return 1
+
+    local configure_extra=""
+    case "$target" in
+        daemon) configure_extra="--without-gui" ;;
+        qt)     configure_extra="--with-gui=qt5" ;;
+        both)   configure_extra="--with-gui=qt5" ;;
+    esac
+    configure_extra="$configure_extra --host=$mingw_triplet --build=$mingw_triplet"
+
+    if [[ "$target" == "qt" || "$target" == "both" ]]; then
+        # MSYS2 pkg-config reports Qt host tool paths in Windows form
+        # (for example C:/msys64/...), which the autotools Qt macros do not
+        # reliably resolve under this native SSH/MSYS2 build flow.
+        configure_extra="$configure_extra --with-qt-bindir=/mingw64/bin"
+        export PATH="/mingw64/bin:/usr/bin:$PATH"
+        export MOC="${MOC:-/mingw64/bin/moc}"
+        export UIC="${UIC:-/mingw64/bin/uic}"
+        export RCC="${RCC:-/mingw64/bin/rcc}"
+        export LRELEASE="${LRELEASE:-/mingw64/bin/lrelease}"
+        export LUPDATE="${LUPDATE:-$(command -v lupdate 2>/dev/null || command -v lupdate-qt5 2>/dev/null || printf '%s' /mingw64/bin/lupdate-qt5.exe)}"
+    fi
+
+    # Modern MSYS2 uses Boost 1.90 with -mt library names for the compiled
+    # components that Photon links against.
+    configure_extra="$configure_extra --with-boost=/mingw64 --with-boost-libdir=/mingw64/lib"
+    configure_extra="$configure_extra --with-boost-filesystem=boost_filesystem-mt"
+    configure_extra="$configure_extra --with-boost-program-options=boost_program_options-mt"
+    configure_extra="$configure_extra --with-boost-thread=boost_thread-mt"
+    configure_extra="$configure_extra --with-boost-chrono=boost_chrono-mt"
+
+    cd "$SCRIPT_DIR"
+    normalize_windows_source_timestamps
+
+    # Patch sources for Qt 5.15+ and Boost 1.73+ compatibility
+    if [[ -f src/qt/trafficgraphwidget.cpp ]]; then
+        grep -q "#include <QPainterPath>" src/qt/trafficgraphwidget.cpp || \
+            sedi '1i #include <QPainterPath>' src/qt/trafficgraphwidget.cpp
+    fi
+
+    # Modern MSYS2 ships Boost.System as a header-only component, so there is
+    # no libboost_system*.a to locate even though Boost itself is present.
+    if ! compgen -G "/mingw64/lib/libboost_system*" >/dev/null; then
+        info "MSYS2 Boost.System is header-only  -  patching legacy boost_system detection"
+        python3 - <<'PY'
+from pathlib import Path
+
+replacement_old = """            if test "x$ax_lib" = "x"; then
+                AC_MSG_ERROR(Could not find a version of the boost_system library!)
+            fi
+\t\t\tif test "x$link_system" = "xno"; then
+\t\t\t\tAC_MSG_ERROR(Could not link against $ax_lib !)
+\t\t\tfi"""
+
+replacement_new = """            if test "x$ax_lib" = "x"; then
+                BOOST_SYSTEM_LIB=""
+                AC_SUBST(BOOST_SYSTEM_LIB)
+                link_system="yes"
+            fi
+\t\t\tif test "x$link_system" = "xno" && test "x$ax_lib" != "x"; then
+\t\t\t\tAC_MSG_ERROR(Could not link against $ax_lib !)
+\t\t\tfi"""
+
+for rel in ("build-aux/m4/ax_boost_system.m4",):
+    p = Path(rel)
+    if not p.exists():
+        continue
+    text = p.read_text()
+    if replacement_old in text:
+        p.write_text(text.replace(replacement_old, replacement_new))
+PY
+    fi
+
+    if [[ "$target" == "qt" || "$target" == "both" ]]; then
+        mkdir -p "$native_dep_root/src"
+        if [[ ! -x "$protobuf_prefix/bin/protoc" || ! -f "$protobuf_prefix/lib/pkgconfig/protobuf.pc" ]]; then
+            info "Building protobuf ${protobuf_version} for native Windows compatibility..."
+            rm -rf "$protobuf_src_dir" "$protobuf_prefix"
+            curl -L "https://github.com/protocolbuffers/protobuf/releases/download/v${protobuf_version}/protobuf-cpp-${protobuf_version}.tar.gz" -o "$protobuf_archive"
+            tar -xzf "$protobuf_archive" -C "$native_dep_root/src"
+            (
+                cd "$protobuf_src_dir"
+                ./configure --prefix="$protobuf_prefix" --disable-shared --enable-static \
+                    CFLAGS="-O2" CXXFLAGS="-O2"
+                make -j"$jobs"
+                make install
+            )
+        fi
+        export PATH="$protobuf_prefix/bin:$PATH"
+        export PKG_CONFIG_PATH="$protobuf_prefix/lib/pkgconfig:/mingw64/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        export QMAKE="$(command -v qmake)"
+        export CPPFLAGS="-I$protobuf_prefix/include -I/mingw64/include -I/mingw64/include/QtCore -I/mingw64/include/QtGui -I/mingw64/include/QtWidgets -I/mingw64/include/QtNetwork ${CPPFLAGS:-}"
+        export LDFLAGS="-L$protobuf_prefix/lib ${LDFLAGS:-}"
+    fi
+
+    info "Running autogen.sh..."
+    ./autogen.sh
+
+    if ! compgen -G "/mingw64/lib/libboost_system*" >/dev/null && [[ -f configure ]]; then
+        python3 - <<'PY'
+from pathlib import Path
+
+p = Path("configure")
+text = p.read_text()
+old = """            if test "x$ax_lib" = "x"; then
+                as_fn_error $? "Could not find a version of the boost_system library!" "$LINENO" 5
+            fi
+\t\t\tif test "x$link_system" = "xno"; then
+\t\t\t\tas_fn_error $? "Could not link against $ax_lib !" "$LINENO" 5
+\t\t\tfi"""
+new = """            if test "x$ax_lib" = "x"; then
+                BOOST_SYSTEM_LIB=""
+                link_system="yes"
+            fi
+\t\t\tif test "x$link_system" = "xno" && test "x$ax_lib" != "x"; then
+\t\t\t\tas_fn_error $? "Could not link against $ax_lib !" "$LINENO" 5
+\t\t\tfi"""
+if old in text:
+    p.write_text(text.replace(old, new))
+PY
+    fi
+
+    info "Configuring..."
+    ./configure --disable-tests --disable-bench $configure_extra \
+        BDB_CFLAGS="-I$windows_bdb_prefix/include" \
+        BDB_LIBS="-L$windows_bdb_prefix/lib -ldb_cxx-4.8 -ldb-4.8" \
+        CFLAGS="$windows_cflags" \
+        CXXFLAGS="$windows_cxxflags"
+
+    # Photon 0.15.2 does not ship the upstream translation payloads.
+    if [[ -f src/Makefile ]]; then
+        sedi 's/^QT_QM.*=.*/QT_QM =/' src/Makefile
+        sedi '/bitcoin_.*\.qm/d' src/Makefile
+        sedi '/locale\/.*\.qm/d' src/Makefile
+        # MSYS2 ships DLL import libraries for Qt/qrencode, not fully static
+        # archives. Native Windows validation builds should link against those
+        # import libs and bundle the resulting DLL dependencies afterward.
+        sedi 's/^LIBTOOL_APP_LDFLAGS = .*/LIBTOOL_APP_LDFLAGS =/' src/Makefile
+    fi
+    mkdir -p src/qt
+    if [[ "$target" == "qt" || "$target" == "both" ]] && command -v protoc &>/dev/null && [[ -f src/qt/paymentrequest.proto ]]; then
+        info "Regenerating paymentrequest protobuf sources for native Windows protobuf..."
+        (
+            cd src/qt
+            protoc --cpp_out=. paymentrequest.proto
+        )
+    fi
+    cat > src/qt/bitcoin_locale.qrc <<'QRC_EOF'
+<!DOCTYPE RCC><RCC version="1.0">
+<qresource prefix="/translations">
+</qresource>
+</RCC>
+QRC_EOF
+
+    info "Building with $jobs jobs..."
+    make -j"$jobs"
 
     if [[ "$target" == "daemon" || "$target" == "both" ]]; then
-        warn "Windows native daemon build not yet implemented"
+        local daemon_bin="src/photond.exe"
+        local cli_bin="src/photon-cli.exe"
+        local tx_bin="src/photon-tx.exe"
+        [[ -f src/.libs/photond.exe ]] && daemon_bin="src/.libs/photond.exe"
+        [[ -f src/.libs/photon-cli.exe ]] && cli_bin="src/.libs/photon-cli.exe"
+        [[ -f src/.libs/photon-tx.exe ]] && tx_bin="src/.libs/photon-tx.exe"
+
+        if [[ "$native_windows_debug_symbols" != "1" ]]; then
+            strip "$daemon_bin" "$cli_bin" "$tx_bin" 2>/dev/null || true
+        fi
+        cp "$daemon_bin" "$output_dir/${DAEMON_NAME}.exe"
+        cp "$cli_bin" "$output_dir/${CLI_NAME}.exe"
+        cp "$tx_bin" "$output_dir/${TX_NAME}.exe"
+
+        # Bundle DLLs
+        info "Bundling DLL dependencies..."
+        for exe in \
+            "$output_dir/${DAEMON_NAME}.exe" \
+            "$output_dir/${CLI_NAME}.exe" \
+            "$output_dir/${TX_NAME}.exe"
+        do
+            ldd "$exe" 2>/dev/null | grep "=> /" | awk '{print $3}' | while read -r dll; do
+                local dll_lc
+                dll_lc=$(printf '%s' "$dll" | tr '[:upper:]' '[:lower:]')
+                case "$dll_lc" in
+                    /c/windows/*) ;;
+                    *) cp -n "$dll" "$output_dir/" 2>/dev/null || true ;;
+                esac
+            done
+        done
+
+        success "Daemon binaries in $output_dir/"
     fi
 
-    os_version="MINGW64 / Windows ($(uname -r 2>/dev/null || echo Windows))"
-    write_build_info "$output_dir" "native" "$target" "$os_version"
+    if [[ "$target" == "qt" || "$target" == "both" ]]; then
+        local qt_bin="src/qt/photon-qt.exe"
+        [[ -f src/qt/.libs/photon-qt.exe ]] && qt_bin="src/qt/.libs/photon-qt.exe"
+
+        if [[ "$native_windows_debug_symbols" != "1" ]]; then
+            strip "$qt_bin" 2>/dev/null || true
+        fi
+        cp "$qt_bin" "$output_dir/${QT_NAME}.exe"
+
+        # Bundle DLLs
+        info "Bundling DLL dependencies..."
+        ldd "$output_dir/${QT_NAME}.exe" 2>/dev/null | grep "=> /" | awk '{print $3}' | while read -r dll; do
+            local dll_lc
+            dll_lc=$(printf '%s' "$dll" | tr '[:upper:]' '[:lower:]')
+            case "$dll_lc" in
+                /c/windows/*) ;;
+                *) cp -n "$dll" "$output_dir/" 2>/dev/null || true ;;
+            esac
+        done
+
+        # Qt platform plugin
+        # Legacy native Windows builds worked because they copied qwindows.dll
+        # from the known MSYS2 Qt plugin directory. Keep the qmake query for
+        # portability, but fall back to the fixed MSYS2 path so fresh Windows
+        # hosts still get a runnable bundle.
+        local qt_plugin_dir=""
+        local qmake_bin=""
+        for qmake_bin in "${QMAKE:-}" "$(command -v qmake 2>/dev/null || true)" "$(command -v qmake-qt5 2>/dev/null || true)" /mingw64/bin/qmake; do
+            [[ -z "$qmake_bin" || ! -x "$qmake_bin" ]] && continue
+            qt_plugin_dir=$("$qmake_bin" -query QT_INSTALL_PLUGINS 2>/dev/null | tr -d '\r')
+            [[ -n "$qt_plugin_dir" && -f "$qt_plugin_dir/platforms/qwindows.dll" ]] && break
+            qt_plugin_dir=""
+        done
+        if [[ -z "$qt_plugin_dir" || ! -f "$qt_plugin_dir/platforms/qwindows.dll" ]]; then
+            if [[ -f /mingw64/share/qt5/plugins/platforms/qwindows.dll ]]; then
+                qt_plugin_dir="/mingw64/share/qt5/plugins"
+            fi
+        fi
+        if [[ -n "$qt_plugin_dir" && -f "$qt_plugin_dir/platforms/qwindows.dll" ]]; then
+            mkdir -p "$output_dir/platforms"
+            cp "$qt_plugin_dir/platforms/qwindows.dll" "$output_dir/platforms/" 2>/dev/null || true
+            cat > "$output_dir/qt.conf" <<'EOF'
+[Paths]
+Plugins=.
+EOF
+        else
+            warn "qwindows.dll not found; native Windows Qt wallet may fail to launch"
+        fi
+
+        success "Qt wallet in $output_dir/"
+    fi
+
+    write_build_info "$output_dir" "native-windows" "$target" "$(detect_os_version windows)"
+    CURRENT_OUTPUT_DIR="$output_dir"
+    GENERATE_CONFIG_AFTER_BUILD=1
 
     echo ""
     echo "============================================"
-    echo "  BUILD SUCCESSFUL — Native Windows"
+    echo "  BUILD SUCCESSFUL  -  Native Windows"
     echo "  Output: $output_dir/"
     echo "============================================"
 }
 
 # =============================================================================
-# MAIN — Parse arguments and dispatch
+# MAIN
 # =============================================================================
 
 main() {
     local platform=""
     local target="both"
-    local docker_mode="none"  # none, pull, build
+    local docker_mode="none"
     local jobs
     local cores
     cores=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
@@ -2275,7 +3765,7 @@ main() {
 
     echo ""
     echo "============================================"
-    echo "  $COIN_NAME_UPPER Build System"
+    echo "  $COIN_NAME_UPPER 0.15.2 Build System"
     echo "============================================"
     echo "  Platform: $platform"
     echo "  Target:   $target"
@@ -2302,8 +3792,9 @@ main() {
             ;;
     esac
 
-    # Generate config file if not already present
-    generate_config "$platform"
+    if [[ "$GENERATE_CONFIG_AFTER_BUILD" == 1 ]]; then
+        generate_config "${CURRENT_OUTPUT_DIR:-$OUTPUT_BASE}"
+    fi
 }
 
 main "$@"

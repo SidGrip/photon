@@ -1,84 +1,82 @@
-// Copyright (c) 2009-2010 Satoshi Nakamoto
-// Distributed under the MIT/X11 software license, see the accompanying
-// file license.txt or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2011 Vince Durham
+// Copyright (c) 2009-2016 The Bitcoin Core developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
 #ifndef BITCOIN_AUXPOW_H
 #define BITCOIN_AUXPOW_H
 
-#include "main.h"
+#include "consensus/params.h"
+#include "primitives/pureheader.h"
+#include "primitives/transaction.h"
+#include "serialize.h"
+#include "uint256.h"
 
-class CAuxPow : public CMerkleTx
+#include <vector>
+
+class CBlockHeader;
+
+static const unsigned char pchMergedMiningHeader[] = { 0xfa, 0xbe, 'm', 'm' };
+
+class CAuxPow
 {
+private:
+    CTransactionRef coinbaseTx;
+    std::vector<uint256> vMerkleBranch;
+
+    static uint256 CheckMerkleBranch(uint256 hash, const std::vector<uint256>& vMerkleBranch, int nIndex);
+
 public:
-    CAuxPow(const CTransaction& txIn) : CMerkleTx(txIn)
-    {
-    }
-
-    CAuxPow() :CMerkleTx()
-    {
-    }
-
-    // Merkle branch with root vchAux
-    // root must be present inside the coinbase
     std::vector<uint256> vChainMerkleBranch;
-    // Index of chain in chains merkle tree
     unsigned int nChainIndex;
-    CBlockHeader parentBlockHeader;
+    CPureBlockHeader parentBlock;
 
-    IMPLEMENT_SERIALIZE
-    (
-        nSerSize += SerReadWrite(s, *(CMerkleTx*)this, nType, nVersion, ser_action);
-        nVersion = this->nVersion;
+    explicit CAuxPow(CTransactionRef txIn)
+        : coinbaseTx(std::move(txIn)), nChainIndex(0)
+    {
+    }
+
+    CAuxPow()
+        : nChainIndex(0)
+    {
+    }
+
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action)
+    {
+        uint256 hashBlock;
+        int nIndex = 0;
+
+        READWRITE(coinbaseTx);
+        READWRITE(hashBlock);
+        READWRITE(vMerkleBranch);
+        READWRITE(nIndex);
         READWRITE(vChainMerkleBranch);
         READWRITE(nChainIndex);
-
-        // Always serialize the saved parent block as header so that the size of CAuxPow
-        // is consistent.
-        nSerSize += SerReadWrite(s, parentBlockHeader, nType, nVersion, ser_action);
-    )
-
-    bool Check(uint256 hashAuxBlock, int nChainID);
-
-    uint256 GetParentBlockHash()
-    {
-        return parentBlockHeader.GetHash();
+        READWRITE(parentBlock);
     }
+
+    bool Check(const uint256& hashAuxBlock, int nChainId, const Consensus::Params& params) const;
+
+    uint256 GetParentBlockPoWHash() const
+    {
+        return parentBlock.GetPoWHash();
+    }
+
+    const CTransactionRef& GetCoinbaseTx() const
+    {
+        return coinbaseTx;
+    }
+
+    const std::vector<uint256>& GetCoinbaseMerkleBranch() const
+    {
+        return vMerkleBranch;
+    }
+
+    static int GetExpectedIndex(uint32_t nNonce, int nChainId, unsigned h);
+    static void InitAuxPow(CBlockHeader& header);
 };
 
-template <typename Stream>
-int ReadWriteAuxPow(Stream& s, const boost::shared_ptr<CAuxPow>& auxpow, int nType, int nVersion, CSerActionGetSerializeSize ser_action)
-{
-    if (nVersion & BLOCK_VERSION_AUXPOW)
-    {
-        return ::GetSerializeSize(*auxpow, nType, nVersion);
-    }
-    return 0;
-}
-
-template <typename Stream>
-int ReadWriteAuxPow(Stream& s, const boost::shared_ptr<CAuxPow>& auxpow, int nType, int nVersion, CSerActionSerialize ser_action)
-{
-    if (nVersion & BLOCK_VERSION_AUXPOW)
-    {
-        return SerReadWrite(s, *auxpow, nType, nVersion, ser_action);
-    }
-    return 0;
-}
-
-template <typename Stream>
-int ReadWriteAuxPow(Stream& s, boost::shared_ptr<CAuxPow>& auxpow, int nType, int nVersion, CSerActionUnserialize ser_action)
-{
-    if (nVersion & BLOCK_VERSION_AUXPOW)
-    {
-        auxpow.reset(new CAuxPow());
-        return SerReadWrite(s, *auxpow, nType, nVersion, ser_action);
-    }
-    else
-    {
-        auxpow.reset();
-        return 0;
-    }
-}
-
-extern void RemoveMergedMiningHeader(std::vector<unsigned char>& vchAux);
-extern CScript MakeCoinbaseWithAux(unsigned int nBits, unsigned int nExtraNonce, std::vector<unsigned char>& vchAux);
-#endif
+#endif // BITCOIN_AUXPOW_H

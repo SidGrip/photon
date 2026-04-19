@@ -1,7 +1,9 @@
 src/*.exe
-src/photon
+src/photon-cli
+src/photon-tx
 src/photond
-src/test_photon
+src/test_bitcoin
+src/qt/locale/*.ts
 .*.swp
 *.*~*
 *.bak
@@ -10,6 +12,9 @@ src/test_photon
 *.o
 *.patch
 .photon
+*.ts
+*.d.ts
+.ts
 
 # Compilation and Qt preprocessor part
 *.qm
@@ -31,9 +36,12 @@ qrc_*.cpp
 .DS_Store
 build
 !src/leveldb*/Makefile
+!depends/Makefile
+!depends/patches/**
 
 # Build outputs (created by build.sh)
 outputs/
+.cache/bdb/
 
 # macOS SDK (Apple license — not redistributable)
 docker/sdk/*.sdk.tar.*

@@ -1,0 +1,12 @@
+#ifndef BITCOIN_CHAINPARAMSSEEDS_H
+#define BITCOIN_CHAINPARAMSSEEDS_H
+/**
+ * List of fixed seed nodes for the Photon network
+ *
+ * Empty — peer discovery relies on DNS seeds (seed.blakestream.io, seed.blakecoin.org).
+ * If DNS seeds are unavailable, use addnode= or connect= in photon.conf.
+ */
+static SeedSpec6 pnSeed6_main[] = {};
+
+static SeedSpec6 pnSeed6_test[] = {};
+#endif // BITCOIN_CHAINPARAMSSEEDS_H

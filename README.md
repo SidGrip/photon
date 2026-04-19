@@ -1,216 +1,215 @@
 <p align="center">
-  <img src="src/qt/res/icons/bitcoin.png" alt="Photon" width="95">
+  <img src="src/qt/res/icons/bitcoin.png" alt="Blakecoin" width="95">
 </p>
 
-## About Photon
+# Blakecoin 0.15.2
 
-Photon is the first Blake-256 merge-mined coin. As Photons are plentiful in the universe, the max supply is set to 90 billion.
+## About Blakecoin
 
-- Cloned from Blakecoin, forked from **Bitcoin 0.8.5**
-- Uses the **Blake-256** hashing algorithm — a SHA-3 candidate faster than Scrypt, SHA-256D, Keccak, and Groestl
-- Optimized 8-round Blake-256 with reduced double-hashing for efficiency
-- Maintains proven ECDSA security
+Blakecoin is the original Blake-256 coin and parent chain for [Photon](https://github.com/BlueDragon747/photon), [BlakeBitcoin](https://github.com/BlakeBitcoin/BlakeBitcoin), [Electron](https://github.com/BlueDragon747/Electron-ELT), [Universal Molecule](https://github.com/BlueDragon747/universalmol), and [Lithium](https://github.com/BlueDragon747/lithium). It is a digital currency using peer-to-peer technology with no central authority.
+
+- Uses the **Blake-256** hashing algorithm
+- Based on **Bitcoin Core 0.15.2**
+- Uses the autotools build system (`./configure` + `make`)
+- Ships release packages for Ubuntu 20.04, 22.04, 24.04, 25.10, Windows, macOS, and Ubuntu 22+ AppImage
 - Website: https://blakecoin.org
 
 | Network Info | |
 |---|---|
 | Algorithm | Blake-256 (8 rounds) |
 | Block time | 3 minutes |
-| Block reward | 32,768 + sqrt(height) * difficulty |
-| Difficulty retarget | Every 20 blocks (max 15% until block 3500, then 3%) |
-| Default port | 35556 |
-| RPC port | 8984 |
-| Max supply | 90,000,000,000 PHO |
+| Block reward | 50 BLC |
+| Difficulty retarget | Every 20 blocks |
+| Default port | 8773 |
+| RPC port | 8772 |
+| Max supply | 7,000,000,000 BLC |
 
 ---
 
-## Quick Start (Ubuntu 18.04)
+## Quick Start
 
 ```bash
-git clone https://github.com/BlueDragon747/photon.git
-cd photon
-sudo add-apt-repository ppa:bitcoin/bitcoin
-sudo apt update
-sudo apt install build-essential libssl-dev libboost-all-dev \
-  libdb4.8-dev libdb4.8++-dev libminiupnpc-dev \
-  qt5-qmake qtbase5-dev qttools5-dev-tools
-bash ./build.sh --native --both
+git clone https://github.com/BlueDragon747/Blakecoin.git
+cd Blakecoin
+bash ./build.sh --help
 ```
 
-- Builds both the daemon (`photond`) and Qt wallet (`photon-qt`) natively on Ubuntu 18.04
-- Binaries go to `outputs/native/`
-- On Linux, Qt builds automatically install a `.desktop` launcher and icon so the wallet appears in Activities search
-- For other Ubuntu versions, use Docker or AppImage
-- See below for macOS, Windows, and other build options
+For most users, downloading a prebuilt release from GitHub Releases is the simplest path.
+Use build.sh to build the release artifacts locally.
+
+---
 
 ## Build Options
 
-```
+```bash
 bash ./build.sh [PLATFORM] [TARGET] [OPTIONS]
 
 Platforms:
-  --native          Build on Linux/Ubuntu 18.04, macOS, or Windows
-  --appimage        Portable Linux AppImage (requires Docker)
+  --native          Build natively on this machine (Linux or macOS)
+  --appimage        Build portable Linux AppImage (requires Docker)
   --windows         Cross-compile for Windows from Linux (requires Docker)
   --macos           Cross-compile for macOS from Linux (requires Docker)
 
 Targets:
-  --daemon          Daemon only (photond)
-  --qt              Qt wallet only (photon-qt)
-  --both            Both (default)
+  --daemon          Build daemon only
+  --qt              Build Qt wallet only
+  --both            Build daemon and Qt wallet (default)
 
-Docker options (for --appimage, --windows, --macos, or --native on Linux):
+Docker options:
   --pull-docker     Pull prebuilt Docker images from Docker Hub
   --build-docker    Build Docker images locally from repo Dockerfiles
+  --no-docker       For --native on Linux: build directly on the host
 
 Other options:
-  --jobs N          Parallel make jobs (default: CPU cores - 1)
+  --jobs N          Parallel make jobs
 ```
+
+---
 
 ## Platform Build Instructions
 
+### Native Linux
+
 ```bash
-git clone https://github.com/BlueDragon747/photon.git
-cd photon
+bash ./build.sh --native --both
 ```
+
+- On supported Ubuntu hosts, `build.sh` auto-detects the OS version and installs missing packages automatically
+- Native Linux release packaging targets Ubuntu `20.04`, `22.04`, `24.04`, and `25.10`
+- Native Linux builds write directly to `outputs/`
+- `--both` refreshes the full Ubuntu-native wallet files directly in `outputs/`
+- `--daemon` refreshes the daemon-side Linux files directly in `outputs/`
+- `--qt` refreshes the Qt wallet files directly in `outputs/`
+- Native Ubuntu outputs are bare same-Ubuntu binaries that rely on host-installed native packages
+- Native Ubuntu builds bootstrap Berkeley DB `4.8.30.NC` into a local repo cache and always link wallet builds against that copy
+- Each Ubuntu output folder gets its own `install-deps.sh` and `README.md` for the non-BDB host runtime packages
 
 ### Linux (Docker)
 
 Use `--pull-docker` to pull prebuilt images from Docker Hub, or `--build-docker` to build them locally from the Dockerfiles in `docker/`.
 
 ```bash
-bash ./build.sh --native --both --pull-docker      # Daemon + Qt (pull from Hub)
-bash ./build.sh --native --qt --pull-docker        # Qt wallet only
-bash ./build.sh --native --daemon --pull-docker    # Daemon only
-bash ./build.sh --native --both --build-docker     # Build Docker image locally first
-bash ./build.sh --appimage --pull-docker           # Portable AppImage
-bash ./build.sh --appimage --build-docker          # AppImage (build image locally)
+bash ./build.sh --native --both --pull-docker
+bash ./build.sh --native --qt --pull-docker
+bash ./build.sh --native --daemon --pull-docker
+bash ./build.sh --native --both --build-docker
 ```
 
+### AppImage
+
+```bash
+bash ./build.sh --appimage --pull-docker
+```
+
+- Uses `sidgrip/appimage-base:22.04`
+- Produces a self-contained AppImage in `outputs/AppImage/`
+- The output folder keeps `Blakecoin-0.15.2-x86_64.AppImage`, `README.md`, and `build-info.txt`
+- Intended for Ubuntu `22.04+`
+- Direct launch on Ubuntu `22.04.5` needs `sudo apt install libfuse2`
+- Direct launch on Ubuntu `24.04.4` and `25.10` needs `sudo apt install libfuse2t64`
+- If the host is missing that package, AppImage runtime startup fails with `dlopen(): error loading libfuse.so.2`
+- Fallback launch remains `--appimage-extract-and-run`
 
 ### Windows
 
-There are two ways to build for Windows:
-
-**Native (MSYS2/MinGW64)** — builds on Windows directly. Produces a ~10MB exe with DLLs bundled alongside it in the output folder.
-
-Install [MSYS2](https://www.msys2.org), then from the MINGW64 shell:
-
 ```bash
-pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-boost \
-  mingw-w64-x86_64-openssl mingw-w64-x86_64-qt5-base \
-  mingw-w64-x86_64-qt5-tools mingw-w64-x86_64-miniupnpc \
-  mingw-w64-x86_64-db
+bash ./build.sh --windows --both --pull-docker
 ```
 
-Then build:
-
-```bash
-bash ./build.sh --native --both          # Daemon + Qt wallet
-bash ./build.sh --native --qt            # Qt wallet only
-bash ./build.sh --native --daemon        # Daemon only
-```
-
-**Docker cross-compile (from Linux)** — builds a single ~30MB static exe with no DLL dependencies.
-
-```bash
-bash ./build.sh --windows --both --pull-docker     # Daemon + Qt (pull from Hub)
-bash ./build.sh --windows --qt --pull-docker       # Qt wallet only
-bash ./build.sh --windows --daemon --pull-docker   # Daemon only
-bash ./build.sh --windows --both --build-docker     # Build MXE image locally first
-bash ./build.sh --windows --qt --build-docker      # Qt only (build image locally)
-bash ./build.sh --windows --daemon --build-docker  # Daemon only (build image locally)
-```
-
-Uses `sidgrip/mxe-base:latest` Docker image with MXE cross-compiler. Everything (Qt, Boost, OpenSSL, etc.) is statically linked into one self-contained exe.
-
-> **Why the difference?**
->
-> - MXE compiles all dependencies from source with the same toolchain, so everything links statically into one binary
-> - MSYS2's static Qt5 package uses a different C runtime (UCRT) than the MinGW64 toolchain (MSVCRT), making fully static linking impossible
-> - The native build auto-bundles all required DLLs in the output folder instead
+- Runs on Linux with Docker using `sidgrip/mxe-base:latest`
+- Writes loose cross-built outputs to `outputs/Windows/`
 
 ### macOS
 
-There are two ways to build for macOS:
+There are two macOS paths in this repo:
 
-**Native (Homebrew)** — builds directly on a Mac.
-
-Install dependencies:
+#### Cross-build from Linux
 
 ```bash
-brew install openssl boost@1.85 miniupnpc berkeley-db@4 qt@5
+bash ./build.sh --macos --both --pull-docker
 ```
 
-Then build:
+- Runs on Linux with Docker using `sidgrip/osxcross-base:latest`
+- Produces artifacts in `outputs/Macosx/`
+
+#### Native build on macOS
 
 ```bash
-bash ./build.sh --native --both          # Daemon + Qt wallet
-bash ./build.sh --native --qt            # Qt wallet only
-bash ./build.sh --native --daemon        # Daemon only
+bash ./build.sh --native --both
 ```
 
-**Docker cross-compile (from Linux)** — builds a macOS binary from a Linux host.
-
-```bash
-bash ./build.sh --macos --both --pull-docker     # Daemon + Qt (pull from Hub)
-bash ./build.sh --macos --qt --pull-docker       # Qt wallet only
-bash ./build.sh --macos --daemon --pull-docker   # Daemon only
-bash ./build.sh --macos --both --build-docker    # Build osxcross image locally first
-bash ./build.sh --macos --qt --build-docker     # Qt only (build image locally)
-bash ./build.sh --macos --daemon --build-docker # Daemon only (build image locally)
-```
-
-Uses `sidgrip/osxcross-base:latest` Docker image with osxcross cross-compiler.
+- Uses Homebrew on the Mac host
+- `build.sh` installs missing Homebrew dependencies automatically
+- Native macOS builds write to `outputs/Macosx/`
 
 ---
 
 ## Output Structure
 
-```
+```text
 outputs/
-├── photon.conf         Auto-generated config with RPC credentials and peers
-├── native/
-│   ├── daemon/         photond
-│   └── qt/             photon-qt
-├── linux-appimage/
-│   └── qt/             Photon-x86_64.AppImage
-├── windows/
-│   ├── daemon/
-│   └── qt/             photon-qt.exe
-└── macos/
-    ├── daemon/         photond
-    └── qt/             Photon-Qt.app
+├── AppImage/
+│   ├── Blakecoin-0.15.2-x86_64.AppImage
+│   ├── README.md
+│   └── build-info.txt
+├── Macosx/
+│   ├── Blakecoin-Qt.app
+│   ├── blakecoin-cli-0.15.2
+│   ├── blakecoin-qt-0.15.2
+│   ├── blakecoin-tx-0.15.2
+│   ├── blakecoind-0.15.2
+│   └── build-info.txt
+├── Ubuntu-20/
+│   ├── README.md
+│   ├── blakecoin-256.png
+│   ├── blakecoin-cli
+│   ├── blakecoin.conf
+│   ├── blakecoin.desktop
+│   ├── blakecoin-qt
+│   ├── blakecoin-qt-bin
+│   ├── blakecoin-tx
+│   ├── blakecoind
+│   └── install-deps.sh
+├── Ubuntu-22/
+├── Ubuntu-24/
+├── Ubuntu-25/
+└── Windows/
+    ├── blakecoin-cli-0.15.2.exe
+    ├── blakecoin-qt-0.15.2.exe
+    ├── blakecoin-tx-0.15.2.exe
+    ├── blakecoind-0.15.2.exe
+    └── build-info.txt
 ```
 
-The config file is auto-generated on first build with random RPC credentials, active peers from the network, and default settings. Copy it to `~/.photon/photon.conf` before running the daemon.
+For Ubuntu native builds, the current host's final wallet files land in `outputs/Ubuntu-20/`, `outputs/Ubuntu-22/`, `outputs/Ubuntu-24/`, or `outputs/Ubuntu-25/` depending on the detected Ubuntu release. These are bare Ubuntu-native binaries, so each Ubuntu folder gets its own `install-deps.sh`, `README.md`, and `blakecoin.conf`. Berkeley DB `4.8.30.NC` is bootstrapped into a local repo cache by the builder rather than being installed from apt.
+
+For Windows cross-builds from Linux, the output bundle lands in `outputs/Windows/`, using `.exe` binaries plus bundled `.dll` files, `qt.conf`, `platforms/qwindows.dll`, and `build-info.txt`.
+
+For native macOS builds, the current host's daemon tools, `Blakecoin-Qt.app`, and the raw `blakecoin-qt-0.15.2` binary all land in `outputs/Macosx/`.
+
+For AppImage builds, `outputs/AppImage/` keeps `Blakecoin-0.15.2-x86_64.AppImage`, `README.md`, and `build-info.txt`.
+
+---
 
 ## Docker Images
 
-Use `--pull-docker` to pull prebuilt images from Docker Hub, or `--build-docker` to build locally from the Dockerfiles in `docker/`.
+When using `--pull-docker`, the build script uses these prebuilt images:
 
-| Image | Platform | Hub Size | Local Build Time |
-|-------|----------|----------|-----------------|
-| `sidgrip/native-base:18.04` | Linux native builds (daemon + Qt) | ~450 MB | ~10 min |
-| `sidgrip/appimage-base:22.04` | Linux AppImage | ~515 MB | ~15 min |
-| `sidgrip/mxe-base:latest` | Windows cross-compile | ~4.2 GB | ~2-4 hours |
-| `sidgrip/osxcross-base:latest` | macOS cross-compile | ~7.2 GB | ~1-2 hours |
-
-Local builds are cached by Docker — subsequent builds are instant.
-
-> **macOS `--build-docker` note:**
->
-> - The macOS cross-compile Dockerfile requires an Apple SDK tarball that **cannot be redistributed**
-> - Place `MacOSX26.2.sdk.tar.xz` in `docker/sdk/` before running `--build-docker`
-> - Extract it from [Xcode](https://developer.apple.com/download/all/): `/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/`
-> - Using `--pull-docker` does **not** require the SDK — it is already included in the prebuilt Docker Hub image
+| Image | Purpose |
+|---|---|
+| `sidgrip/native-base:20.04` | Native Linux Ubuntu 20.04 build |
+| `sidgrip/native-base:22.04` | Native Linux Ubuntu 22.04 build |
+| `sidgrip/native-base:24.04` | Native Linux Ubuntu 24.04 build |
+| `sidgrip/appimage-base:22.04` | Ubuntu 22+ AppImage build |
+| `sidgrip/mxe-base:latest` | Windows cross-compile |
+| `sidgrip/osxcross-base:latest` | macOS cross-compile |
 
 ---
 
 ## Multi-Coin Builder
 
-For building wallets for all Blake-family coins [Blakecoin](https://github.com/BlueDragon747/Blakecoin), [Photon](https://github.com/BlueDragon747/photon), [BlakeBitcoin](https://github.com/BlakeBitcoin/BlakeBitcoin), [Electron](https://github.com/BlueDragon747/Electron-ELT), [Universal Molecule](https://github.com/BlueDragon747/universalmol), [Lithium](https://github.com/BlueDragon747/lithium), see the [Blakestream Installer](https://github.com/SidGrip/Blakestream-Installer).
+For building wallets for all Blake-family coins [Blakecoin](https://github.com/BlueDragon747/Blakecoin), [Photon](https://github.com/BlueDragon747/photon), [BlakeBitcoin](https://github.com/BlakeBitcoin/BlakeBitcoin), [Electron](https://github.com/BlueDragon747/Electron-ELT), [Universal Molecule](https://github.com/BlueDragon747/universalmol), and [Lithium](https://github.com/BlueDragon747/lithium), see the [Blakestream Installer](https://github.com/SidGrip/Blakestream-Installer).
 
 ## License
 
-Photon is released under the terms of the MIT license. See `COPYING` for more information.
+Blakecoin is released under the terms of the MIT license. See `COPYING` for more information.
