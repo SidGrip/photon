@@ -160,8 +160,8 @@ RES_ICONS = \
   qt/res/icons/address-book.png \
   qt/res/icons/about.png \
   qt/res/icons/about_qt.png \
-  qt/res/icons/Blakecoin_32.ico \
-  qt/res/icons/Blakecoin_32_testnet.ico \
+  qt/res/icons/photon_32.ico \
+  qt/res/icons/photon_32_testnet.ico \
   qt/res/icons/bitcoin.png \
   qt/res/icons/chevron.png \
   qt/res/icons/clock1.png \

@@ -10,7 +10,7 @@ SetCompressor /SOLID lzma
 !define URL https://github.com/BlueDragon747/photon
 
 # MUI Symbol Definitions
-!define MUI_ICON "/home/sid/Blakestream-Installer/repos/Photon-0.15.21/share/pixmaps/Blakecoin.ico"
+!define MUI_ICON "/home/sid/Blakestream-Installer/repos/Photon-0.15.21/share/pixmaps/bitcoin.ico"
 !define MUI_WELCOMEFINISHPAGE_BITMAP "/home/sid/Blakestream-Installer/repos/Photon-0.15.21/share/pixmaps/nsis-wizard.bmp"
 !define MUI_HEADERIMAGE
 !define MUI_HEADERIMAGE_RIGHT
@@ -104,7 +104,7 @@ Section -post SEC0001
     WriteRegDWORD HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$(^Name)" NoModify 1
     WriteRegDWORD HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$(^Name)" NoRepair 1
     WriteRegStr HKCR "photon" "URL Protocol" ""
-    WriteRegStr HKCR "photon" "" "URL:Bitcoin"
+    WriteRegStr HKCR "photon" "" "URL:Photon"
     WriteRegStr HKCR "photon\DefaultIcon" "" $INSTDIR\photon-qt
     WriteRegStr HKCR "photon\shell\open\command" "" '"$INSTDIR\photon-qt" "%1"'
 SectionEnd

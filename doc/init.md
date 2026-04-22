@@ -67,10 +67,10 @@ can then be controlled by group membership.
 
 3b) Mac OS X
 
-Binary:              `/usr/local/bin/bitcoind`  
-Configuration file:  `~/Library/Application Support/Bitcoin/bitcoin.conf`  
-Data directory:      `~/Library/Application Support/Bitcoin`
-Lock file:           `~/Library/Application Support/Bitcoin/.lock`
+Binary:              `/usr/local/bin/photond`
+Configuration file:  `~/Library/Application Support/Photon/photon.conf`
+Data directory:      `~/Library/Application Support/Photon`
+Lock file:           `~/Library/Application Support/Photon/.lock`
 
 4. Installing Service Configuration
 -----------------------------------
