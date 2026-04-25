@@ -42,12 +42,7 @@ static CBlock CreateGenesisBlock(const char* pszTimestamp, const CScript& genesi
  * transaction cannot be spent since it did not originally exist in the
  * database.
  *
- * Blakecoin Genesis Block:
- * CBlock(hash=0000000f14c5..., ver=1, hashPrevBlock=00000000000000, hashMerkleRoot=4a5e1e, nTime=1372066561, nBits=1d00ffff, nNonce=421575, vtx=1)
- *   CTransaction(hash=4a5e1e, ver=1, vin.size=1, vout.size=1, nLockTime=0)
- *     CTxIn(COutPoint(000000, -1), coinbase 04ffff001d010445...)
- *     CTxOut(nValue=50.00000000, scriptPubKey=...)
- *   vMerkleTree: 4a5e1e
+ * Photon legacy genesis block (inherited from 0.8 main.cpp).
  */
 static CBlock CreateGenesisBlock(uint32_t nTime, uint32_t nNonce, uint32_t nBits, int32_t nVersion, const CAmount& genesisReward)
 {
@@ -78,24 +73,19 @@ class CMainParams : public CChainParams {
 public:
     CMainParams() {
         strNetworkID = "main";
-        // BEGIN BLAKECOIN: Blakecoin uses dynamic subsidy, not halving
-        // Subsidy formula: 25 + sqrt(difficulty * height) BLC
+        // Photon uses a difficulty-aware subsidy: 32768 + floor(sqrt(diff * height)) PHO.
+        // Implemented in validation.cpp::GetBlockSubsidy. Halving interval is unused.
         consensus.nSubsidyHalvingInterval = std::numeric_limits<int>::max(); // No halving
-        // END BLAKECOIN
-        // BEGIN BLAKECOIN: Set BIP heights to disable version checks for historical blocks
-        // Blakecoin uses different block versioning - disable these checks
+        // Photon disables BIP34/65/66 version checks for historical compatibility.
         consensus.BIP34Height = 100000000; // Disabled - far in future
-        consensus.BIP34Hash = uint256S("0x000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8");
+        consensus.BIP34Hash = uint256();
         consensus.BIP65Height = 100000000; // Disabled - far in future
         consensus.BIP66Height = 100000000; // Disabled - far in future
-        // END BLAKECOIN
-        // BEGIN BLAKECOIN: Proof of work limit: difficulty 1 target from nBits 0x1e00ffff
-        // Target = 0x00ffff * 256^27 = 000000ffff000000000000000000000000000000000000000000000000000000
+        // Proof of work limit: compact 0x1e00ffff (matches legacy 0.8 ~uint256(0) >> 24).
         consensus.powLimit = uint256S("000000ffff000000000000000000000000000000000000000000000000000000");
-        // Difficulty adjustment: every 20 blocks (1 hour with 3-minute blocks)
-        consensus.nPowTargetTimespan = 20 * 3 * 60;       // 1 hour (20 blocks * 3 minutes)
-        consensus.nPowTargetSpacing = 3 * 60;             // 3 minutes (Blakecoin)
-        // END BLAKECOIN
+        // Difficulty adjustment: every 20 blocks (1 hour with 3-minute blocks).
+        consensus.nPowTargetTimespan = 20 * 3 * 60;       // 1 hour
+        consensus.nPowTargetSpacing = 3 * 60;             // 3 minutes
         consensus.fPowAllowMinDifficultyBlocks = false;
         consensus.fPowNoRetargeting = false;
         consensus.fStrictChainId = true;
