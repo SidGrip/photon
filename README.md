@@ -2,58 +2,158 @@
   <img src="src/qt/res/icons/bitcoin.png" alt="Photon" width="95">
 </p>
 
-# Photon 0.15.21
+# Photon Core 0.25.2
 
-> SegWit signaling schedule: Photon mainnet versionbits signaling starts on May 11, 2026 00:00:00 UTC (`1778457600`) and times out on May 11, 2027 00:00:00 UTC (`1809993600`). Activation still depends on BIP9 lock-in.
+Photon Core 0.25.2 is the Photon aux-chain port of Bitcoin Core v25.2.
+It keeps Photon's Blake-family chain identity, AuxPoW merged-mining rules,
+and BLAKE-256 proof-of-work while adding the Taproot-era Core codebase,
+descriptor-wallet support, SQLite wallet support, ZMQ, and Linux USDT
+tracepoints for hardened release builds.
+
+## Mainnet Consensus Changes In 0.25.2
+
+Photon 0.25.2 is intended to follow the 0.15.21 SegWit mainnet activation
+and then activate the next Bitcoin-compatible script rule sets in a staged
+order. Pools and miners should use the daemon-provided AuxPoW block-template
+version; do not manually rewrite version bits.
+
+| Rule set | Mainnet policy in Photon 0.25.2 |
+|---|---|
+| SegWit (`BIP141` / `BIP143` / `BIP147`) | Already active from 0.15.21; buried at height `2051160`. No new SegWit signaling window in 0.25.2. |
+| `BIP34` coinbase height | Height activation at `2072227`; `BIP34Hash = uint256{}`. |
+| `BIP65` / CLTV | Height activation at `2072227`; required for standard CLTV atomic-swap refunds. |
+| `BIP66` / strict DER | Height activation at `2072227`. |
+| Taproot (`BIP340` / `BIP341` / `BIP342`) | BIP9 deployment bit `2`, start `1782871200` (`2026-07-01 02:00:00 UTC`), timeout `1814407200` (`2027-07-01 02:00:00 UTC`), minimum activation height `2075587`. |
+
+Only Taproot is a future BIP9-signaled deployment in 0.25.2. `BIP34`,
+`BIP65`, `BIP66`, and buried SegWit are height rules. Photon Core computes
+the correct BIP9 top bits, Taproot bit `2`, AuxPoW flag, and Photon chain-ID
+bits in block templates.
 
 ## About Photon
 
-Photon is a Blake-256 cryptocurrency in the BlakeStream family. This repository carries the Photon Core `0.15.21` update and ships build/release packaging for native Ubuntu `20.04`, `22.04`, `24.04`, `25.10`, Windows, native macOS, and Ubuntu `22.04+` AppImage.
+Photon is a BlakeStream AuxPoW chain merge-mined under the Blakecoin parent
+chain. It is a peer-to-peer digital currency with no central authority.
 
-- Uses the **Blake-256** hashing algorithm
-- Based on **Bitcoin Core 0.15.2**
-- Uses the autotools build system (`./configure` + `make`)
-- Ships release packages for Ubuntu 20.04, 22.04, 24.04, 25.10, Windows, macOS, and Ubuntu 22+ AppImage
+- Uses the Blake-256 hashing algorithm, 8 rounds
+- Based on Bitcoin Core v25.2
+- Uses AuxPoW / merged mining with chain ID `0x0002`
+- Uses the autotools build system (`./autogen.sh`, `./configure`, `make`)
+- Supports legacy Berkeley DB wallets and descriptor SQLite wallets
+- Keeps Photon txids on single SHA-256
+- Uses HASH256/double SHA-256 for witness-v0 BIP143 signing
+- Keeps BIP340/BIP341/BIP342 Taproot tagged hashes byte-compatible with Bitcoin
 
-| Network Info | |
+| Network Info | Value |
 |---|---|
-| Algorithm | Blake-256 (8 rounds) |
-| Block time | 180 seconds (3 minutes) |
+| Algorithm | Blake-256, 8 rounds |
+| Block time | 3 minutes |
 | Block reward | 32,768 PHO base plus legacy difficulty-weighted increment |
-| Difficulty retarget | Every 20 blocks (60 minutes) |
-| Default port | 35556 |
-| RPC port | 8984 |
-| Max supply | 90,000,000,000 PHO |
+| Difficulty retarget | Every 20 blocks |
+| Coinbase maturity | 120 blocks |
+| AuxPoW chain ID | `0x0002` |
+| AuxPoW start height | `160000` on mainnet; active from genesis on testnet/regtest |
+| Max supply policy | 90,000,000,000 PHO target supply policy |
+| Default P2P port | `35556` |
+| RPC port | `8984` |
+| Mainnet genesis | `000000e79a20d718a2f2d8b98161dc6700104a22d8e9be70e8ac361ee6664b9c` |
+| Mainnet Bech32 HRP | `pho` |
+| Testnet Bech32 HRP | `tpho` |
+| Regtest Bech32 HRP | `rpho` |
 
----
+## Network Activation Notes
+
+The SegWit activation block is height `2051160`.
+
+Testnet is treated as a 0.25.2 feature-test/reset network. SegWit, BIP34,
+BIP65/CLTV, BIP66, and Taproot are active from height `1` on testnet so
+wallet, merged-mining, atomic-swap, Lightning, and Taproot behavior can be
+tested without waiting on mainnet-style activation windows.
+
+Regtest keeps override support through `-testactivationheight=` and
+`-vbparams=` for activation-cycle tests. AuxPoW is available from genesis on
+regtest.
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/SidGrip/photon.git
-cd photon
-bash ./build.sh --help
+./build.sh --help
 ```
 
-For most users, downloading a prebuilt release from GitHub Releases is the simplest path.
-Use build.sh to build the release artifacts locally.
+For most users, downloading a tested release artifact from GitHub Releases is
+the simplest path. Use `build.sh` to build release artifacts locally.
 
----
+For configuration options, see [config-help.md](config-help.md).
+
+## Upgrade Notes
+
+Before starting Photon Core 0.25.2 on an existing data directory, close the
+older wallet cleanly and back up any wallet files first.
+
+When syncing 0.25.2 from old 0.8/0.15.21-era chains, header presync can look slow or restart because v25 verifies low-work header chains before storing them. For trusted bootstrap only, use `-minimumchainwork=0 -connect=<trusted-node>` and remove those options after the node catches up.
+
+`peers.dat` is only the cached P2P address database. It is safe to remove or
+rename when moving between major releases, and Photon will rebuild it on the
+next start. If startup fails with `Invalid or corrupt peers.dat`, remove or
+rename this file:
+
+- Windows: `%APPDATA%\Photon\peers.dat`
+- Linux: `~/.photon/peers.dat`
+- macOS: `~/Library/Application Support/Photon/peers.dat`
+
+Windows PowerShell example:
+
+```powershell
+Rename-Item "$env:APPDATA\Photon\peers.dat" "peers.dat.bak"
+```
+
+Linux example:
+
+```bash
+mv ~/.photon/peers.dat ~/.photon/peers.dat.bak
+```
+
+macOS example:
+
+```bash
+mv "$HOME/Library/Application Support/Photon/peers.dat" \
+   "$HOME/Library/Application Support/Photon/peers.dat.bak"
+```
+
+If the block index or chainstate database cannot be reused after an upgrade,
+restart once with `-reindex` to rebuild the local block database from the
+stored block files:
+
+```bash
+photond -reindex
+```
+
+Pruning is disabled by default (`-prune=0`), so a normal Photon Core node keeps
+full block data. Public release nodes, explorers, pools, and bridge/watch
+services should run unpruned unless they have a specific reason to discard old
+block data.
+
+For first-run testing of a new 0.25.2 build, use an isolated data directory so
+the test does not touch an existing 0.15.21 wallet or chainstate:
+
+```bash
+photon-qt -datadir=/path/to/photon-25.2-test
+```
 
 ## Build Options
 
 ```bash
-bash ./build.sh [PLATFORM] [TARGET] [OPTIONS]
+./build.sh [PLATFORM] [TARGET] [OPTIONS]
 
 Platforms:
-  --native          Build natively on this machine (Linux or macOS)
+  --native          Build natively on this machine (Linux, macOS, or Windows)
   --appimage        Build portable Linux AppImage (requires Docker)
   --windows         Cross-compile for Windows from Linux (requires Docker)
   --macos           Cross-compile for macOS from Linux (requires Docker)
 
 Targets:
-  --daemon          Build daemon only
-  --qt              Build Qt wallet only
+  --daemon          Build daemon only (photond + photon-cli + photon-tx)
+  --qt              Build Qt wallet only (photon-qt)
   --both            Build daemon and Qt wallet (default)
 
 Docker options:
@@ -62,103 +162,111 @@ Docker options:
   --no-docker       For --native on Linux: build directly on the host
 
 Other options:
+  --hardened-release
+                   Native Linux release profile: enable SQLite, ZMQ, and USDT
+                   and fail the build if configure disables any of them
   --jobs N          Parallel make jobs
 ```
-
----
 
 ## Platform Build Instructions
 
 ### Native Linux
 
 ```bash
-bash ./build.sh --native --both
+./build.sh --native --both --no-docker
 ```
 
-- On supported Ubuntu hosts, `build.sh` auto-detects the OS version and installs missing packages automatically
-- Native Linux release packaging targets Ubuntu `20.04`, `22.04`, `24.04`, and `25.10`
-- Native Linux builds write directly to `outputs/`
-- `--both` refreshes the full Ubuntu-native wallet files directly in `outputs/`
-- `--daemon` refreshes the daemon-side Linux files directly in `outputs/`
-- `--qt` refreshes the Qt wallet files directly in `outputs/`
-- Native Ubuntu outputs are bare same-Ubuntu binaries that rely on host-installed native packages
-- Native Ubuntu builds bootstrap Berkeley DB `4.8.30.NC` into a local repo cache and always link wallet builds against that copy
-- Each Ubuntu output folder gets its own `install-deps.sh` and `README.md` for the non-BDB host runtime packages
+- Supported validation lanes: Ubuntu 20.04, 22.04, 24.04, and 26.04
+- Public Linux release lane: Ubuntu 26.04
+- Ubuntu 20.04 remains a test/compatibility lane and is not planned as a public
+  prebuilt release artifact for 0.25.2
+- Native Linux outputs are written under `outputs/Ubuntu-XX/`
+- Berkeley DB 4.8 is bootstrapped into the repo cache for legacy wallet
+  compatibility
+- Dual-wallet builds enable both Berkeley DB and SQLite
 
-### Linux (Docker)
-
-Use `--pull-docker` to pull prebuilt images from Docker Hub, or `--build-docker` to build them locally from the Dockerfiles in `docker/`.
+Recommended hardened Ubuntu 26 release build:
 
 ```bash
-bash ./build.sh --native --both --pull-docker
-bash ./build.sh --native --qt --pull-docker
-bash ./build.sh --native --daemon --pull-docker
-bash ./build.sh --native --both --build-docker
+DOCKER_NATIVE=sidgrip/native-base:26.04 \
+  ./build.sh --native --both --build-docker --hardened-release --jobs 5
+```
+
+The hardened Linux release profile requires:
+
+- `USE_BDB=true`
+- `USE_SQLITE=true`
+- `ENABLE_ZMQ=true`
+- `ENABLE_USDT_TRACEPOINTS=true`
+
+USDT runtime attach validation is Linux/eBPF-specific. macOS and Windows builds
+do not fail release acceptance because they do not expose the Linux USDT
+backend.
+
+### Native Linux With Docker
+
+Use `--pull-docker` to pull prebuilt images from Docker Hub, or
+`--build-docker` to build the selected base image locally from the Dockerfiles
+in `docker/`.
+
+```bash
+./build.sh --native --both --pull-docker
+./build.sh --native --qt --pull-docker
+./build.sh --native --daemon --pull-docker
+DOCKER_NATIVE=sidgrip/native-base:26.04 \
+  ./build.sh --native --both --build-docker --hardened-release --jobs 5
 ```
 
 ### AppImage
 
 ```bash
-bash ./build.sh --appimage --pull-docker
+./build.sh --appimage --pull-docker
 ```
 
 - Uses `sidgrip/appimage-base:22.04`
-- Produces a self-contained AppImage in `outputs/AppImage/`
-- The output folder keeps `Photon-0.15.21-x86_64.AppImage`, `README.md`, and `build-info.txt`
-- Intended for Ubuntu `22.04+`
-- Direct launch on Ubuntu `22.04.5` needs `sudo apt install libfuse2`
-- Direct launch on Ubuntu `24.04.4` and `25.10` needs `sudo apt install libfuse2t64`
-- If the host is missing that package, AppImage runtime startup fails with `dlopen(): error loading libfuse.so.2`
-- Fallback launch remains `--appimage-extract-and-run`
+- Produces a portable Linux AppImage under `outputs/AppImage/`
+- Intended for Ubuntu 22.04 and newer
+- If the host lacks FUSE support, launch with `--appimage-extract-and-run`
 
 ### Windows
 
 ```bash
-bash ./build.sh --windows --both --pull-docker
+./build.sh --windows --both --pull-docker
 ```
 
-- Runs on Linux with Docker using `sidgrip/mxe-base:latest`
-- Writes loose cross-built outputs to `outputs/Windows/`
+- Windows release artifacts come from the MXE cross-compile container
+- Uses `sidgrip/mxe-base:latest`
+- Outputs are written under `outputs/Windows/`
+- Native Windows builds are diagnostic only and are not the release lane because
+  they do not package the same bundled DLL/runtime layout
 
 ### macOS
 
-There are two macOS paths in this repo:
-
-#### Cross-build from Linux
-
 ```bash
-bash ./build.sh --macos --both --pull-docker
+./build.sh --native --both --no-docker
 ```
 
-- Runs on Linux with Docker using `sidgrip/osxcross-base:sdk-26.2`
-- Produces artifacts in `outputs/Macosx/`
-
-#### Native build on macOS
-
-```bash
-bash ./build.sh --native --both
-```
-
-- Uses Homebrew on the Mac host
-- `build.sh` installs missing Homebrew dependencies automatically
-- Native macOS builds write to `outputs/Macosx/`
-
----
+- Official macOS release artifacts are built natively on macOS
+- Native macOS builds use Homebrew dependencies
+- Berkeley DB 4.8, SQLite, and ZMQ should be enabled
+- USDT tracing is Linux/eBPF-specific and is not a macOS release gate
 
 ## Output Structure
 
 ```text
 outputs/
 ├── AppImage/
-│   ├── Photon-0.15.21-x86_64.AppImage
+│   ├── Photon-0.25.2-x86_64.AppImage
 │   ├── README.md
 │   └── build-info.txt
 ├── Macosx/
 │   ├── Photon-Qt.app
-│   ├── photon-cli-0.15.21
-│   ├── photon-qt-0.15.21
-│   ├── photon-tx-0.15.21
-│   ├── photond-0.15.21
+│   ├── photon-cli-0.25.2
+│   ├── photon-qt-0.25.2
+│   ├── photon-tx-0.25.2
+│   ├── photon-util-0.25.2
+│   ├── photon-wallet-0.25.2
+│   ├── photond-0.25.2
 │   └── build-info.txt
 ├── Ubuntu-20/
 │   ├── README.md
@@ -167,30 +275,35 @@ outputs/
 │   ├── photon.conf
 │   ├── photon.desktop
 │   ├── photon-qt
-│   ├── photon-qt-bin
 │   ├── photon-tx
+│   ├── photon-util
+│   ├── photon-wallet
 │   ├── photond
+│   ├── build-info.txt
 │   └── install-deps.sh
 ├── Ubuntu-22/
 ├── Ubuntu-24/
-├── Ubuntu-25/
+├── Ubuntu-26/
 └── Windows/
-    ├── photon-cli-0.15.21.exe
-    ├── photon-qt-0.15.21.exe
-    ├── photon-tx-0.15.21.exe
-    ├── photond-0.15.21.exe
+    ├── photon-cli-0.25.2.exe
+    ├── photon-qt-0.25.2.exe
+    ├── photon-tx-0.25.2.exe
+    ├── photon-util-0.25.2.exe
+    ├── photon-wallet-0.25.2.exe
+    ├── photond-0.25.2.exe
     └── build-info.txt
 ```
 
-For Ubuntu native builds, the current host's final wallet files land in `outputs/Ubuntu-20/`, `outputs/Ubuntu-22/`, `outputs/Ubuntu-24/`, or `outputs/Ubuntu-25/` depending on the detected Ubuntu release. These are bare Ubuntu-native binaries, so each Ubuntu folder gets its own `install-deps.sh`, `README.md`, and `photon.conf`. Berkeley DB `4.8.30.NC` is bootstrapped into a local repo cache by the builder rather than being installed from apt.
+For Ubuntu native builds, the current host's final wallet files land in
+`outputs/Ubuntu-20/`, `outputs/Ubuntu-22/`, `outputs/Ubuntu-24/`, or
+`outputs/Ubuntu-26/` depending on the detected Ubuntu release. Each Ubuntu
+folder gets its own `install-deps.sh`, `README.md`, `build-info.txt`, and
+`photon.conf`.
 
-For Windows cross-builds from Linux, the output bundle lands in `outputs/Windows/` and contains the four `.exe` binaries plus `build-info.txt`.
-
-For native macOS builds, the current host's daemon tools, `Photon-Qt.app`, and the raw `photon-qt-0.15.21` binary all land in `outputs/Macosx/`.
-
-For AppImage builds, `outputs/AppImage/` keeps `Photon-0.15.21-x86_64.AppImage`, `README.md`, and `build-info.txt`.
-
----
+For Windows cross-builds from Linux, the output bundle lands in
+`outputs/Windows/` and contains versioned `.exe` binaries plus
+`build-info.txt`. For native macOS builds, `Photon-Qt.app` and the versioned
+daemon tools land in `outputs/Macosx/`.
 
 ## Docker Images
 
@@ -200,18 +313,33 @@ When using `--pull-docker`, the build script uses these prebuilt images:
 |---|---|
 | `sidgrip/native-base:20.04` | Native Linux Ubuntu 20.04 build |
 | `sidgrip/native-base:22.04` | Native Linux Ubuntu 22.04 build |
-| `sidgrip/native-base:24.04` | Native Linux Ubuntu 24.04 build |
-| `sidgrip/native-base:25.10` | Native Linux Ubuntu 25.10 build |
-| `sidgrip/appimage-base:22.04` | Ubuntu 22+ AppImage build |
+| `sidgrip/native-base:24.04` | Native Linux Ubuntu 24.04 build; default native Docker image |
+| `sidgrip/native-base:26.04` | Native Linux Ubuntu 26.04 build and hardened release lane |
+| `sidgrip/appimage-base:22.04` | Ubuntu 22.04+ AppImage build |
 | `sidgrip/mxe-base:latest` | Windows cross-compile |
 | `sidgrip/osxcross-base:sdk-26.2` | macOS cross-compile |
 
----
+## AuxPoW Mining RPCs
+
+Photon exposes the AuxPoW mining RPCs used by merged-mining pools:
+
+- `createauxblock <address>`
+- `submitauxblock <hash> <auxpow>`
+- `getauxblock` with no arguments, using `-auxpowmineraddress=<address>`
+- `getauxblock <hash> <auxpow>` submit mode
+
+AuxPoW templates include the daemon-computed `version` and `versionHex` fields.
+Pools should verify those fields, but should not rewrite them. During Taproot
+`started` and `locked_in`, the daemon sets bit `2`; after Taproot is active,
+miners do not need to keep signaling the bit.
 
 ## Multi-Coin Builder
 
-For building wallets for all Blake-family coins [Blakecoin](https://github.com/SidGrip/Blakecoin), [Photon](https://github.com/SidGrip/photon), [BlakeBitcoin](https://github.com/SidGrip/BlakeBitcoin), [Electron-ELT](https://github.com/SidGrip/Electron-ELT), [UniversalMolecule](https://github.com/SidGrip/universalmol), and [Lithium](https://github.com/SidGrip/lithium), see the [Blakestream Installer](https://github.com/SidGrip/Blakestream-Installer).
+For coordinated BlakeStream-family wallet builds, see the
+[Blakestream Installer](https://github.com/SidGrip/Blakestream-Installer).
 
 ## License
 
-Photon is released under the terms of the MIT license. See `COPYING` for more information.
+Photon Core is released under the terms of the MIT license. See
+[COPYING](COPYING) for more information or see
+https://opensource.org/licenses/MIT.

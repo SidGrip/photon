@@ -1,0 +1,33 @@
+# /etc/conf.d/photond: config file for /etc/init.d/photond
+
+# Config file location
+#PHOTOND_CONFIGFILE="/etc/photon/photon.conf"
+
+# What directory to write pidfile to?  (created and owned by $PHOTOND_USER)
+#PHOTOND_PIDDIR="/var/run/photond"
+
+# What filename to give the pidfile
+#PHOTOND_PIDFILE="${PHOTOND_PIDDIR}/photond.pid"
+
+# Where to write Photon data (be mindful that the blockchain is large)
+#PHOTOND_DATADIR="/var/lib/photond"
+
+# User and group to own photond process
+#PHOTOND_USER="photon"
+#PHOTOND_GROUP="photon"
+
+# Path to photond executable
+#PHOTOND_BIN="/usr/bin/photond"
+
+# Nice value to run photond under
+#PHOTOND_NICE=0
+
+# Additional options (avoid -conf and -datadir, use flags above)
+#PHOTOND_OPTS=""
+
+# The timeout in seconds OpenRC will wait for photond to terminate
+# after a SIGTERM has been raised.
+# Note that this will be mapped as argument to start-stop-daemon's
+# '--retry' option, which means you can specify a retry schedule
+# here. For more information see man 8 start-stop-daemon.
+PHOTOND_SIGTERM_TIMEOUT=600

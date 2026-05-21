@@ -1,11 +1,11 @@
 #!/bin/bash
 # =============================================================================
-# Photon 0.15.21 Build Script  -  All Platforms
+# Photon 0.25.2 Build Script  -  All Platforms
 #
 # Single self-contained script to build Photon daemon and/or Qt wallet
 # for Linux, macOS, Windows, and AppImage.
 #
-# Based on Bitcoin Core 0.15.2  -  uses autotools (./configure + make).
+# Based on Bitcoin Core 25.2 - uses autotools (./configure + make).
 # Windows cross-compilation still uses pre-built libraries in the Docker image.
 # macOS cross-compilation now defaults to a depends + CONFIG_SITE flow inside
 # the Docker image, with the older pre-built-libs path kept as a fallback.
@@ -17,12 +17,12 @@
 #   sidgrip/native-base:20.04      -  Native Linux (Ubuntu 20.04, GCC 9, Boost 1.71)
 #   sidgrip/native-base:22.04      -  Native Linux (Ubuntu 22.04, GCC 11, Boost 1.74)
 #   sidgrip/native-base:24.04      -  Native Linux (Ubuntu 24.04, GCC 13, Boost 1.83)
-#   sidgrip/native-base:25.10      -  Native Linux (Ubuntu 25.10, GCC 15, Boost 1.88)
+#   sidgrip/native-base:26.04      -  Native Linux (Ubuntu 26.04, GCC 15, Boost 1.88)
 #   sidgrip/appimage-base:22.04    -  AppImage builds (Ubuntu 22.04 + appimagetool)
 #   sidgrip/mxe-base:latest        -  Windows cross-compile (MXE + MinGW)
 #   sidgrip/osxcross-base:sdk-26.2  -  macOS cross-compile (depends + osxcross SDK 26.2)
 #
-# Repository: https://github.com/BlueDragon747/Photon (branch: master)
+# Repository: https://github.com/SidGrip/Photon.git (branch: photon-25.2-auxpow-port)
 # =============================================================================
 
 set -euo pipefail
@@ -33,11 +33,15 @@ COIN_NAME="photon"
 COIN_NAME_UPPER="Photon"
 DAEMON_NAME="photond"
 QT_NAME="photon-qt"
+QT_WM_CLASS="Photon-Qt"
+QT_DESKTOP_ID="org.photon.photon-qt"
 CLI_NAME="photon-cli"
 TX_NAME="photon-tx"
-VERSION="0.15.21"
-REPO_URL="https://github.com/BlueDragon747/photon.git"
-REPO_BRANCH="master"
+WALLET_NAME="${COIN_NAME}-wallet"
+UTIL_NAME="${COIN_NAME}-util"
+VERSION="0.25.2"
+REPO_URL="https://github.com/SidGrip/Photon.git"
+REPO_BRANCH="photon-25.2-auxpow-port"
 QT_LINUX_LAUNCHER_SOURCE="$SCRIPT_DIR/contrib/linux-release/blakecoin-qt-launcher.c"
 APPIMAGE_PUBLIC_NAME="${COIN_NAME_UPPER}-${VERSION}-x86_64.AppImage"
 WINDOWS_ICON_SOURCE_PNG="$SCRIPT_DIR/src/qt/res/icons/bitcoin.png"
@@ -51,6 +55,13 @@ NATIVE_LINUX_ALL_DEPS=()
 NATIVE_LINUX_ALL_DEPS_STR=""
 CURRENT_OUTPUT_DIR=""
 GENERATE_CONFIG_AFTER_BUILD=0
+# 25.2 release policy is dual-wallet by default: Berkeley DB for legacy
+# wallet.dat plus SQLite for descriptor wallets. Set ENABLE_SQLITE=0 only for
+# explicit diagnostic legacy-only builds.
+ENABLE_SQLITE="${ENABLE_SQLITE:-1}"
+ENABLE_ZMQ="${ENABLE_ZMQ:-0}"
+ENABLE_USDT="${ENABLE_USDT:-0}"
+HARDENED_RELEASE="${HARDENED_RELEASE:-0}"
 
 # Network ports and config
 RPC_PORT=8984
@@ -88,6 +99,59 @@ info()    { echo -e "${CYAN}[INFO]${NC} $*"; }
 success() { echo -e "${GREEN}[OK]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; }
+
+is_enabled() {
+    case "${1:-0}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+apply_build_profile() {
+    if is_enabled "$HARDENED_RELEASE"; then
+        ENABLE_SQLITE=1
+        ENABLE_ZMQ=1
+        ENABLE_USDT=1
+    fi
+}
+
+feature_status() {
+    if is_enabled "$1"; then
+        printf 'enabled'
+    else
+        printf 'disabled'
+    fi
+}
+
+build_profile_name() {
+    if is_enabled "$HARDENED_RELEASE"; then
+        printf 'hardened-release'
+    else
+        printf 'standard'
+    fi
+}
+
+verify_native_feature_config() {
+    local config_path="$1"
+
+    [[ -f "$config_path" ]] || {
+        error "Missing configure output: $config_path"
+        exit 1
+    }
+
+    if is_enabled "$ENABLE_SQLITE" && ! grep -q '^USE_SQLITE=true$' "$config_path"; then
+        error "SQLite was requested but USE_SQLITE=true is absent from $config_path"
+        exit 1
+    fi
+    if is_enabled "$ENABLE_ZMQ" && ! grep -q '^ENABLE_ZMQ=true$' "$config_path"; then
+        error "ZMQ was requested but ENABLE_ZMQ=true is absent from $config_path"
+        exit 1
+    fi
+    if is_enabled "$ENABLE_USDT" && ! grep -q '^ENABLE_USDT_TRACEPOINTS=true$' "$config_path"; then
+        error "USDT was requested but ENABLE_USDT_TRACEPOINTS=true is absent from $config_path"
+        exit 1
+    fi
+}
 
 # Fix execute permissions after copying source tree (rsync/cp can lose +x bits)
 fix_permissions() {
@@ -163,9 +227,40 @@ sedi() {
     fi
 }
 
+sync_windows_icon_assets() {
+    if ! command -v python3 &>/dev/null; then
+        warn "python3 not found; using checked-in Windows icon assets."
+        return 0
+    fi
+
+    if ! python3 -c 'from PIL import Image' >/dev/null 2>&1; then
+        warn "python3-pil not found; using checked-in Windows icon assets."
+        return 0
+    fi
+
+    info "Regenerating Windows icon assets from repo bitcoin.png sources..."
+    python3 - <<PY
+from PIL import Image
+
+sizes = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+targets = [
+    ("$WINDOWS_ICON_SOURCE_PNG", "$WINDOWS_EXE_ICON_ICO"),
+    ("$WINDOWS_ICON_SOURCE_PNG", "$WINDOWS_INSTALLER_ICON_ICO"),
+    ("$WINDOWS_ICON_SOURCE_TESTNET_PNG", "$WINDOWS_EXE_ICON_TESTNET_ICO"),
+]
+
+for src, dst in targets:
+    img = Image.open(src).convert("RGBA")
+    img.save(dst, format="ICO", sizes=sizes)
+    print(f"    generated {dst} from {src}")
+PY
+}
+
 ensure_windows_icon_assets() {
     local missing=()
     local path
+
+    sync_windows_icon_assets
 
     for path in \
         "$WINDOWS_ICON_SOURCE_PNG" \
@@ -204,6 +299,14 @@ ensure_macos_brew_env() {
     if [[ -n "$brew_bin" && -x "$brew_bin" ]]; then
         eval "$("$brew_bin" shellenv)" >/dev/null 2>&1 || true
         export PATH="$(dirname "$brew_bin"):$PATH"
+        # Native macOS Autoconf 2.73 requires a modern GNU m4. Homebrew keeps m4
+        # keg-only, so put it ahead of /usr/bin/m4 when it is installed.
+        local m4_prefix
+        m4_prefix="$("$brew_bin" --prefix m4 2>/dev/null || true)"
+        if [[ -n "$m4_prefix" && -x "$m4_prefix/bin/m4" ]]; then
+            export PATH="$m4_prefix/bin:$PATH"
+            export M4="$m4_prefix/bin/m4"
+        fi
         return 0
     fi
 
@@ -258,6 +361,9 @@ Docker options (for --appimage, --windows, --macos, or --native on Linux):
   --no-docker       For --native on Linux: skip Docker, build directly on host
 
 Other options:
+  --hardened-release
+                   Native Linux release profile: enable SQLite, ZMQ, and USDT
+                   and fail the build if configure disables any of them
   --jobs N          Parallel make jobs (default: CPU cores - 1)
   -h, --help        Show this help
 
@@ -267,8 +373,9 @@ Examples:
   ./build.sh --native --daemon                 # Daemon only
 
   # Native Linux with Docker
-  ./build.sh --native --both --pull-docker     # Use appimage-base from Docker Hub
+  ./build.sh --native --both --pull-docker     # Use native-base from Docker Hub
   ./build.sh --native --both --build-docker    # Same as --pull-docker (shared images)
+  DOCKER_NATIVE=sidgrip/native-base:26.04 ./build.sh --native --both --build-docker --hardened-release
 
   # Cross-compile (Docker required  -  choose --pull-docker or --build-docker)
   ./build.sh --windows --qt --pull-docker      # Pull mxe-base from Docker Hub
@@ -279,7 +386,7 @@ Docker Hub images (used with --pull-docker):
   sidgrip/native-base:20.04             Native Linux (Ubuntu 20.04, GCC 9)
   sidgrip/native-base:22.04             Native Linux (Ubuntu 22.04, GCC 11)
   sidgrip/native-base:24.04             Native Linux (Ubuntu 24.04, GCC 13) [default]
-  sidgrip/native-base:25.10             Native Linux (Ubuntu 25.10, GCC 15)
+  sidgrip/native-base:26.04             Native Linux (Ubuntu 26.04, GCC 15)
   sidgrip/appimage-base:22.04           AppImage (Ubuntu 22.04 + appimagetool)
   sidgrip/mxe-base:latest               Windows cross-compile (MXE + MinGW)
   sidgrip/osxcross-base:sdk-26.2        macOS cross-compile (depends + osxcross SDK 26.2) [default]
@@ -329,7 +436,7 @@ normalize_ubuntu_output_label() {
         20.04*) echo "Ubuntu-20" ;;
         22.04*) echo "Ubuntu-22" ;;
         24.04*) echo "Ubuntu-24" ;;
-        25.10*) echo "Ubuntu-25" ;;
+        26.04*) echo "Ubuntu-26" ;;
         *)
             local major="${ubuntu_ver%%.*}"
             if [[ -n "$major" && "$major" != "$ubuntu_ver" ]]; then
@@ -374,19 +481,27 @@ cleanup_legacy_output_root() {
         "$OUTPUT_BASE/$DAEMON_NAME" \
         "$OUTPUT_BASE/$CLI_NAME" \
         "$OUTPUT_BASE/$TX_NAME" \
+        "$OUTPUT_BASE/$WALLET_NAME" \
+        "$OUTPUT_BASE/$UTIL_NAME" \
         "$OUTPUT_BASE/$QT_NAME" \
         "$OUTPUT_BASE/${QT_NAME}-bin" \
         "$OUTPUT_BASE/${DAEMON_NAME}.exe" \
         "$OUTPUT_BASE/${CLI_NAME}.exe" \
         "$OUTPUT_BASE/${TX_NAME}.exe" \
+        "$OUTPUT_BASE/${WALLET_NAME}.exe" \
+        "$OUTPUT_BASE/${UTIL_NAME}.exe" \
         "$OUTPUT_BASE/${QT_NAME}.exe" \
         "$OUTPUT_BASE/${DAEMON_NAME}-${VERSION}" \
         "$OUTPUT_BASE/${CLI_NAME}-${VERSION}" \
         "$OUTPUT_BASE/${TX_NAME}-${VERSION}" \
+        "$OUTPUT_BASE/${WALLET_NAME}-${VERSION}" \
+        "$OUTPUT_BASE/${UTIL_NAME}-${VERSION}" \
         "$OUTPUT_BASE/${QT_NAME}-${VERSION}" \
         "$OUTPUT_BASE/${DAEMON_NAME}-${VERSION}.exe" \
         "$OUTPUT_BASE/${CLI_NAME}-${VERSION}.exe" \
         "$OUTPUT_BASE/${TX_NAME}-${VERSION}.exe" \
+        "$OUTPUT_BASE/${WALLET_NAME}-${VERSION}.exe" \
+        "$OUTPUT_BASE/${UTIL_NAME}-${VERSION}.exe" \
         "$OUTPUT_BASE/${QT_NAME}-${VERSION}.exe" \
         "$OUTPUT_BASE/install-deps.sh" \
         "$OUTPUT_BASE/${COIN_NAME}.desktop" \
@@ -543,7 +658,7 @@ ensure_repo_bdb48() {
             ;;
     esac
 
-    env CFLAGS="-O2" CXXFLAGS="-O2 -std=c++11" "${configure_cmd[@]}" >&2
+    env CFLAGS="-O2 -std=gnu89" CXXFLAGS="-O2 -std=c++11" "${configure_cmd[@]}" >&2
     make -j"$jobs" libdb_cxx-4.8.a libdb-4.8.a >&2
 
     mkdir -p "$prefix_tmp/lib" "$prefix_tmp/include"
@@ -697,13 +812,18 @@ write_build_info() {
 
     mkdir -p "$output_dir"
     cat > "$output_dir/build-info.txt" <<EOF
-Coin:       $COIN_NAME_UPPER 0.15.21
+Coin:       $COIN_NAME_UPPER 0.25.2
 Target:     $target
 Platform:   $platform
 OS:         $os_version
 Date:       $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 Branch:     $REPO_BRANCH
 Script:     build.sh
+Profile:    $(build_profile_name)
+BDB:        Berkeley DB 4.8
+SQLite:     $(feature_status "$ENABLE_SQLITE")
+ZMQ:        $(feature_status "$ENABLE_ZMQ")
+USDT:       $(feature_status "$ENABLE_USDT")
 EOF
 }
 
@@ -847,7 +967,6 @@ compile_linux_qt_launcher() {
     local output_path="$1"
     local target_rel="${2:-.runtime/${QT_NAME}-bin}"
     local use_runtime_env="${3:-1}"
-    local force_docker="${4:-0}"
     local launcher_cc="${CC:-}"
     local output_dir=""
     local output_name=""
@@ -866,7 +985,7 @@ compile_linux_qt_launcher() {
         exit 1
     }
 
-    if [[ "$force_docker" != "1" && -z "$launcher_cc" ]]; then
+    if [[ -z "$launcher_cc" ]]; then
         for candidate in gcc cc clang; do
             if command -v "$candidate" >/dev/null 2>&1; then
                 launcher_cc="$candidate"
@@ -875,7 +994,7 @@ compile_linux_qt_launcher() {
         done
     fi
 
-    if [[ "$force_docker" == "1" || -z "$launcher_cc" ]]; then
+    [[ -n "$launcher_cc" ]] || {
         if command -v docker >/dev/null 2>&1 && [[ -n "${DOCKER_NATIVE:-}" ]]; then
             output_dir="$(cd "$(dirname "$output_path")" && pwd)"
             output_name="$(basename "$output_path")"
@@ -905,7 +1024,7 @@ done
 "$compiler" -O2 -s -Wall -Wextra -no-pie \
     "-DBLAKECOIN_QT_LAUNCH_TARGET=\"${BLAKECOIN_QT_LAUNCH_TARGET}\"" \
     "-DBLAKECOIN_QT_USE_RUNTIME_ENV=${BLAKECOIN_QT_USE_RUNTIME_ENV}" \
-    /repo/contrib/linux-release/photon-qt-launcher.c \
+    /repo/contrib/linux-release/blakecoin-qt-launcher.c \
     -o "/out/${BLAKECOIN_QT_LAUNCH_OUTPUT}"
 '
         else
@@ -914,7 +1033,7 @@ done
         fi
         chmod +x "$output_path"
         return
-    fi
+    }
 
     # Ubuntu 20's default PIE launcher gets classified as application/x-sharedlib
     # in GNOME, so force a normal executable for release-click behavior.
@@ -928,12 +1047,14 @@ write_linux_release_desktop() {
     cat > "$desktop_path" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Photon Qt
+Name=Photon
 Comment=Photon Cryptocurrency Wallet
 Exec=photon-qt
 Icon=photon-qt
 Terminal=false
+StartupNotify=true
 Categories=Finance;Network;
+StartupWMClass=Photon-Qt
 EOF
 }
 
@@ -951,11 +1072,19 @@ resolve_native_linux_packages() {
         libssl-dev
         libevent-dev
         libminiupnpc-dev
-        libzmq5
         libprotobuf-dev
         protobuf-compiler
         libboost-all-dev
     )
+    if [[ "$ENABLE_SQLITE" == "1" || "$ENABLE_SQLITE" == "true" || "$ENABLE_SQLITE" == "yes" ]]; then
+        NATIVE_LINUX_ALL_DEPS+=(libsqlite3-dev)
+    fi
+    if is_enabled "$ENABLE_ZMQ"; then
+        NATIVE_LINUX_ALL_DEPS+=(libzmq3-dev python3-zmq)
+    fi
+    if is_enabled "$ENABLE_USDT"; then
+        NATIVE_LINUX_ALL_DEPS+=(systemtap-sdt-dev python3-bpfcc bpfcc-tools bpftrace)
+    fi
 
     if [[ "$target" == "qt" || "$target" == "both" ]]; then
         qt_deps=(qtbase5-dev qttools5-dev qttools5-dev-tools libqrencode-dev)
@@ -972,6 +1101,73 @@ write_linux_install_deps_script() {
     cat > "$script_path" <<EOF
 #!/bin/bash
 set -euo pipefail
+
+SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+
+# Native Ubuntu release convenience: install the bundled launcher and icon for
+# the current desktop user so docks/sidebars show the coin icon instead of the
+# generic executable icon. This is intentionally user-local and does not need
+# root privileges.
+if [ -f "\$SCRIPT_DIR/${COIN_NAME}.desktop" ] && [ -f "\$SCRIPT_DIR/${COIN_NAME}-256.png" ]; then
+    desktop_dir="\$HOME/.local/share/applications"
+    icon_dir="\$HOME/.local/share/icons/hicolor/256x256/apps"
+    desktop_dst="\$desktop_dir/${QT_DESKTOP_ID}.desktop"
+    legacy_desktop_dst="\$desktop_dir/${QT_NAME}.desktop"
+    qt_class_desktop_dst="\$desktop_dir/${QT_WM_CLASS}.desktop"
+    icon_dst="\$icon_dir/${QT_NAME}.png"
+
+    mkdir -p "\$desktop_dir" "\$icon_dir"
+    if [ "\$legacy_desktop_dst" != "\$desktop_dst" ]; then
+        rm -f "\$legacy_desktop_dst"
+    fi
+    if [ "\$qt_class_desktop_dst" != "\$desktop_dst" ]; then
+        rm -f "\$qt_class_desktop_dst"
+    fi
+    cp "\$SCRIPT_DIR/${COIN_NAME}.desktop" "\$desktop_dst"
+    cp "\$SCRIPT_DIR/${COIN_NAME}-256.png" "\$icon_dst"
+
+    if [ -x "\$SCRIPT_DIR/${QT_NAME}" ]; then
+        sed -i "s|^Exec=.*|Exec=\$SCRIPT_DIR/${QT_NAME}|" "\$desktop_dst"
+    fi
+    if grep -q '^Icon=' "\$desktop_dst"; then
+        sed -i 's|^Icon=.*|Icon=${QT_NAME}|' "\$desktop_dst"
+    else
+        printf '\\nIcon=${QT_NAME}\\n' >> "\$desktop_dst"
+    fi
+    if grep -q '^Name=' "\$desktop_dst"; then
+        sed -i 's|^Name=.*|Name=${COIN_NAME_UPPER}|' "\$desktop_dst"
+    else
+        printf 'Name=${COIN_NAME_UPPER}\\n' >> "\$desktop_dst"
+    fi
+    if grep -q '^StartupWMClass=' "\$desktop_dst"; then
+        sed -i 's|^StartupWMClass=.*|StartupWMClass=${QT_WM_CLASS}|' "\$desktop_dst"
+    else
+        printf 'StartupWMClass=${QT_WM_CLASS}\\n' >> "\$desktop_dst"
+    fi
+    if grep -q '^StartupNotify=' "\$desktop_dst"; then
+        sed -i 's|^StartupNotify=.*|StartupNotify=true|' "\$desktop_dst"
+    else
+        printf 'StartupNotify=true\\n' >> "\$desktop_dst"
+    fi
+
+    index_theme="\$HOME/.local/share/icons/hicolor/index.theme"
+    if [ ! -f "\$index_theme" ]; then
+        mkdir -p "\$(dirname "\$index_theme")"
+        printf '%s\\n' '[Icon Theme]' 'Name=Hicolor' 'Comment=Fallback Icon Theme' 'Directories=256x256/apps' '' '[256x256/apps]' 'Size=256' 'Context=Applications' 'Type=Fixed' > "\$index_theme"
+    fi
+
+    chmod +x "\$desktop_dst"
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "\$desktop_dir" >/dev/null 2>&1 || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -q "\$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+    fi
+    if command -v gio >/dev/null 2>&1; then
+        gio set "\$desktop_dst" metadata::trusted true >/dev/null 2>&1 || true
+    fi
+    echo "Installed ${COIN_NAME_UPPER} desktop launcher: \$desktop_dst"
+fi
 
 sudo apt-get update -qq
 sudo apt-get install -y -qq ${install_packages}
@@ -1031,7 +1227,7 @@ sudo apt-get install -y -qq ${install_packages}
 ## Installation (optional)
 
 \`\`\`bash
-cp photond photon-cli photon-tx ~/.local/bin/
+cp photond photon-cli photon-tx photon-wallet photon-util ~/.local/bin/
 \`\`\`
 
 After the native packages are installed, the daemon tools can live outside this folder.
@@ -1205,6 +1401,8 @@ cleanup_linux_native_output_root() {
         "$OUTPUT_BASE/$DAEMON_NAME" \
         "$OUTPUT_BASE/$CLI_NAME" \
         "$OUTPUT_BASE/$TX_NAME" \
+        "$OUTPUT_BASE/$WALLET_NAME" \
+        "$OUTPUT_BASE/$UTIL_NAME" \
         "$OUTPUT_BASE/$QT_NAME" \
         "$OUTPUT_BASE/${QT_NAME}-bin" \
         "$OUTPUT_BASE/install-deps.sh" \
@@ -1264,19 +1462,27 @@ cleanup_simple_output_root() {
         "$OUTPUT_BASE/$DAEMON_NAME" \
         "$OUTPUT_BASE/$CLI_NAME" \
         "$OUTPUT_BASE/$TX_NAME" \
+        "$OUTPUT_BASE/$WALLET_NAME" \
+        "$OUTPUT_BASE/$UTIL_NAME" \
         "$OUTPUT_BASE/$QT_NAME" \
         "$OUTPUT_BASE/${QT_NAME}-bin" \
         "$OUTPUT_BASE/${DAEMON_NAME}.exe" \
         "$OUTPUT_BASE/${CLI_NAME}.exe" \
         "$OUTPUT_BASE/${TX_NAME}.exe" \
+        "$OUTPUT_BASE/${WALLET_NAME}.exe" \
+        "$OUTPUT_BASE/${UTIL_NAME}.exe" \
         "$OUTPUT_BASE/${QT_NAME}.exe" \
         "$OUTPUT_BASE/${DAEMON_NAME}-${VERSION}" \
         "$OUTPUT_BASE/${CLI_NAME}-${VERSION}" \
         "$OUTPUT_BASE/${TX_NAME}-${VERSION}" \
+        "$OUTPUT_BASE/${WALLET_NAME}-${VERSION}" \
+        "$OUTPUT_BASE/${UTIL_NAME}-${VERSION}" \
         "$OUTPUT_BASE/${QT_NAME}-${VERSION}" \
         "$OUTPUT_BASE/${DAEMON_NAME}-${VERSION}.exe" \
         "$OUTPUT_BASE/${CLI_NAME}-${VERSION}.exe" \
         "$OUTPUT_BASE/${TX_NAME}-${VERSION}.exe" \
+        "$OUTPUT_BASE/${WALLET_NAME}-${VERSION}.exe" \
+        "$OUTPUT_BASE/${UTIL_NAME}-${VERSION}.exe" \
         "$OUTPUT_BASE/${QT_NAME}-${VERSION}.exe" \
         "$OUTPUT_BASE/install-deps.sh" \
         "$OUTPUT_BASE/${COIN_NAME}.desktop" \
@@ -1351,20 +1557,22 @@ install_linux_desktop_launcher() {
 
     mkdir -p "$desktop_dir" "$icon_dir"
     if [[ -f "$icon_source" ]]; then
-        cp "$icon_source" "$icon_dir/${COIN_NAME}.png"
+        cp "$icon_source" "$icon_dir/${QT_NAME}.png"
     fi
-    cat > "$desktop_dir/${QT_NAME}.desktop" <<DEOF
+    rm -f "$desktop_dir/${QT_NAME}.desktop" "$desktop_dir/${QT_WM_CLASS}.desktop"
+    cat > "$desktop_dir/${QT_DESKTOP_ID}.desktop" <<DEOF
 [Desktop Entry]
 Type=Application
-Name=Photon Qt
-Icon=$icon_dir/${COIN_NAME}.png
+Name=Photon
+Icon=${QT_NAME}
 Exec=$qt_bundle_dir/$QT_NAME
 Terminal=false
+StartupNotify=true
 Categories=Finance;Network;
-StartupWMClass=${QT_NAME}
+StartupWMClass=${QT_WM_CLASS}
 DEOF
-    chmod +x "$desktop_dir/${QT_NAME}.desktop"
-    info "Desktop launcher installed  -  Photon Qt will appear in Activities search"
+    chmod +x "$desktop_dir/${QT_DESKTOP_ID}.desktop"
+    info "Desktop launcher installed  -  Photon will appear in Activities search"
 }
 
 detect_native_docker_ubuntu_version() {
@@ -1374,7 +1582,7 @@ detect_native_docker_ubuntu_version() {
         *native-base:20.04*) version="20.04" ;;
         *native-base:22.04*) version="22.04" ;;
         *native-base:24.04*) version="24.04" ;;
-        *native-base:25.10*) version="25.10" ;;
+        *native-base:26.04*) version="26.04" ;;
     esac
 
     if [[ -n "$version" ]]; then
@@ -1410,7 +1618,7 @@ chmod +x ${APPIMAGE_PUBLIC_NAME}
 
 - Ubuntu 22.04.5: \`sudo apt install libfuse2\`
 - Ubuntu 24.04.4: \`sudo apt install libfuse2t64\`
-- Ubuntu 25.10: \`sudo apt install libfuse2t64\`
+- Ubuntu 26.04: \`sudo apt install libfuse2t64\`
 
 If the host is missing that package, direct AppImage startup fails with:
 
@@ -1467,6 +1675,7 @@ finalize_linux_native_output() {
 
     cleanup_legacy_output_root
     cleanup_target_output_dir "$output_dir"
+    write_build_info "$output_dir" "native-linux" "$target" "Ubuntu $ubuntu_ver"
 
     if [[ "$target" == "daemon" || "$target" == "both" ]]; then
         cp "$daemon_source" "$output_dir/$DAEMON_NAME"
@@ -1477,7 +1686,7 @@ finalize_linux_native_output() {
     if [[ "$target" == "qt" || "$target" == "both" ]]; then
         if [[ "$ubuntu_ver" == 20.04* ]]; then
             cp "$qt_source_binary" "$output_dir/${QT_NAME}-bin"
-            compile_linux_qt_launcher "$output_dir/$QT_NAME" "${QT_NAME}-bin" 0 1
+            compile_linux_qt_launcher "$output_dir/$QT_NAME" "${QT_NAME}-bin" 0
         else
             cp "$qt_source_binary" "$output_dir/$QT_NAME"
         fi
@@ -1654,7 +1863,7 @@ ensure_docker_image() {
             *native-base:20.04*)  dockerfile="Dockerfile.native-base-20.04" ;;
             *native-base:22.04*)  dockerfile="Dockerfile.native-base-22.04" ;;
             *native-base:24.04*)  dockerfile="Dockerfile.native-base-24.04" ;;
-            *native-base:25.10*)  dockerfile="Dockerfile.native-base-25.10" ;;
+            *native-base:26.04*)  dockerfile="Dockerfile.native-base-26.04" ;;
             *native-base*)        dockerfile="Dockerfile.native-base-22.04" ;;
             *appimage-base*)      dockerfile="Dockerfile.appimage-base" ;;
             *mxe-base*)           dockerfile="Dockerfile.mxe-base" ;;
@@ -1713,7 +1922,7 @@ build_windows() {
     local target="$1"
     local jobs="$2"
     local docker_mode="$3"
-    local container_name="win-${COIN_NAME}-0152-build"
+    local container_name="win-${COIN_NAME}-0252-build"
     local output_dir=""
 
     echo ""
@@ -1739,21 +1948,43 @@ build_windows() {
     clean_stale_build_artifacts "$tmpdir"
     fix_permissions "$tmpdir"
 
+    if is_enabled "$ENABLE_USDT"; then
+        warn "USDT tracing is Linux/eBPF-only for release artifacts; disabling it for Windows MXE."
+        ENABLE_USDT=0
+    fi
+
     # Build configure flags based on target
     local configure_extra=""
     case "$target" in
-        daemon) configure_extra="--without-gui" ;;
+        daemon) configure_extra="--with-gui=no" ;;
         qt)     configure_extra="--with-gui=qt5" ;;
         both)   configure_extra="--with-gui=qt5" ;;
     esac
+    if is_enabled "$ENABLE_SQLITE"; then
+        configure_extra="$configure_extra --with-sqlite=yes"
+    fi
+    if is_enabled "$ENABLE_ZMQ"; then
+        configure_extra="$configure_extra --enable-zmq"
+    else
+        configure_extra="$configure_extra --disable-zmq"
+    fi
 
     docker create \
         --name "$container_name" \
-        -v "$tmpdir:/build/$COIN_NAME:rw" \
+        -e BLAKE_ENABLE_SQLITE="$ENABLE_SQLITE" \
+        -e BLAKE_ENABLE_ZMQ="$ENABLE_ZMQ" \
+        -v "$tmpdir:/build/blakecoin:rw" \
         "$DOCKER_WINDOWS" \
         /bin/bash -c '
 set -e
-cd /build/'"$COIN_NAME"'
+cd /build/blakecoin
+
+is_enabled() {
+    case "${1:-0}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 # MXE cross-compiler setup
 export PATH=/opt/mxe/usr/bin:$PATH
@@ -1783,6 +2014,13 @@ cp ${MXE_SYSROOT}/lib/mxe_bak/libcrypto.a ${MXE_SYSROOT}/lib/libcrypto.a
 
 # Verify Qt5 is findable
 pkg-config --cflags Qt5Core 2>/dev/null && echo ">>> Qt5Core found via pkg-config" || echo "WARNING: Qt5Core not found"
+if is_enabled "$BLAKE_ENABLE_ZMQ"; then
+    if [ -f "${MXE_SYSROOT}/lib/pkgconfig/libzmq.pc" ] && ! pkg-config --atleast-version=4 libzmq 2>/dev/null; then
+        echo ">>> Normalizing MXE libzmq pkg-config version for Bitcoin Core configure..."
+        sed -i "s/^Version:.*/Version: 4.3.5/" "${MXE_SYSROOT}/lib/pkgconfig/libzmq.pc"
+    fi
+    pkg-config --exists "libzmq >= 4" || { echo "ERROR: MXE libzmq >= 4 not available"; exit 1; }
+fi
 
 # Patch sources for Qt 5.15+ and Boost 1.73+ compatibility
 echo ">>> Patching sources..."
@@ -1809,7 +2047,7 @@ if [ ! -f "${QT5LIBDIR}/libQt5PlatformSupport.a" ]; then
     echo ">>> Creating merged Qt5PlatformSupport.a from split modules..."
     _qt5ps_save_dir=$(pwd)
     mkdir -p /tmp/qt5ps && cd /tmp/qt5ps
-    for lib in EventDispatcherSupport FontDatabaseSupport ThemeSupport AccessibilitySupport WindowsUIAutomationSupport; do
+    for lib in AccessibilitySupport DeviceDiscoverySupport EdidSupport EventDispatcherSupport FbSupport FontDatabaseSupport PlatformCompositorSupport ThemeSupport WindowsUIAutomationSupport; do
         [ -f "${QT5LIBDIR}/libQt5${lib}.a" ] && ar x "${QT5LIBDIR}/libQt5${lib}.a"
     done
     ar crs "${QT5LIBDIR}/libQt5PlatformSupport.a" *.o 2>/dev/null || ar crs "${QT5LIBDIR}/libQt5PlatformSupport.a"
@@ -1819,9 +2057,25 @@ Name: Qt5PlatformSupport
 Description: Merged compat lib for Qt 5.14+ (split into separate modules)
 Version: 5.15
 Cflags:
-Libs: -L${QT5LIBDIR} -lQt5PlatformSupport -lQt5EventDispatcherSupport -lQt5FontDatabaseSupport -lQt5ThemeSupport -lQt5AccessibilitySupport
+Libs: -L${QT5LIBDIR} -lQt5PlatformSupport -lQt5AccessibilitySupport -lQt5DeviceDiscoverySupport -lQt5EdidSupport -lQt5EventDispatcherSupport -lQt5FbSupport -lQt5FontDatabaseSupport -lQt5PlatformCompositorSupport -lQt5ThemeSupport -lQt5WindowsUIAutomationSupport
 PCEOF
 fi
+
+# MXE static Qt split-support libraries ship .prl files but not always
+# matching pkg-config files. Bitcoin Core Qt m4 probes the .pc names before
+# we patch the final Makefile link line, so provide minimal shims here.
+for qtlib in AccessibilitySupport DeviceDiscoverySupport EdidSupport EventDispatcherSupport FbSupport FontDatabaseSupport PlatformCompositorSupport ThemeSupport WindowsUIAutomationSupport; do
+    pc="${QT5LIBDIR}/pkgconfig/Qt5${qtlib}.pc"
+    if [ ! -f "$pc" ] && [ -f "${QT5LIBDIR}/libQt5${qtlib}.a" ]; then
+        cat > "$pc" <<PCEOF
+Name: Qt5${qtlib}
+Description: MXE static Qt5 ${qtlib} compatibility shim
+Version: 5.15
+Cflags: -I${QT5INC}
+Libs: -L${QT5LIBDIR} -lQt5${qtlib}
+PCEOF
+    fi
+done
 
 echo ">>> Running autogen.sh..."
 ./autogen.sh
@@ -1833,8 +2087,9 @@ sed -i "/as_fn_error.*Could not resolve/s/as_fn_error/true #/" configure
 
 echo ">>> Configuring for Windows ($HOST)..."
 ./configure --host=$HOST --prefix=/usr/local \
-    --disable-tests --disable-bench \
+    --disable-tests --disable-bench --disable-fuzz-binary \
     --with-qt-plugindir=${MXE_SYSROOT}/qt5/plugins \
+    --with-qtdbus=no \
     --with-boost=/opt/compat \
     --with-boost-libdir=/opt/compat/lib \
     '"$configure_extra"' \
@@ -1845,6 +2100,15 @@ echo ">>> Configuring for Windows ($HOST)..."
     BDB_CFLAGS="-I/opt/compat/include" \
     BDB_LIBS="-L/opt/compat/lib -ldb_cxx-4.8 -ldb-4.8" \
     PROTOC=/opt/mxe/usr/x86_64-pc-linux-gnu/bin/protoc
+
+if is_enabled "$BLAKE_ENABLE_SQLITE" && ! grep -q "^USE_SQLITE=true$" test/config.ini; then
+    echo "ERROR: SQLite was requested but USE_SQLITE=true is absent from test/config.ini"
+    exit 1
+fi
+if is_enabled "$BLAKE_ENABLE_ZMQ" && ! grep -q "^ENABLE_ZMQ=true$" test/config.ini; then
+    echo "ERROR: ZMQ was requested but ENABLE_ZMQ=true is absent from test/config.ini"
+    exit 1
+fi
 
 # The MXE Boost 1.81 headers emit duplicate category singletons when this legacy
 # tree is forced through C++11. Moving the Windows cross-build to C++17 avoids
@@ -1875,7 +2139,7 @@ QRC_EOF
 # Fix static link deps: use --start-group to resolve circular Qt5/platform plugin deps
 if [ -f src/Makefile ]; then
     echo ">>> Fixing static link dependencies (--start-group for circular deps)..."
-    sed -i "s|^LIBS = \(.*\)|LIBS = -Wl,--start-group \1 -L${MXE_SYSROOT}/qt5/plugins/platforms -lqwindows -L${MXE_SYSROOT}/qt5/lib -lQt5Widgets -lQt5Gui -lQt5Network -lQt5Core -lQt5PlatformSupport -lQt5AccessibilitySupport -lQt5WindowsUIAutomationSupport -lQt5EventDispatcherSupport -lQt5FontDatabaseSupport -lQt5ThemeSupport -lharfbuzz -lfreetype -lharfbuzz_too -lfreetype_too -lbz2 -lpng16 -lbrotlidec -lbrotlicommon -lglib-2.0 -lintl -liconv -lpcre2-8 -lpcre2-16 -lzstd -lssl -lcrypto -ld3d11 -ldxgi -ldxguid -luxtheme -ldwmapi -ldnsapi -liphlpapi -lcrypt32 -lmpr -luserenv -lnetapi32 -lversion -lcomdlg32 -loleaut32 -limm32 -lshlwapi -latomic -lz -lws2_32 -lgdi32 -luser32 -lkernel32 -ladvapi32 -lole32 -lshell32 -luuid -lwinmm -lrpcrt4 -lssp -lwinspool -lcomctl32 -lwtsapi32 -lm -Wl,--end-group|" src/Makefile
+    sed -i "s|^LIBS = \(.*\)|LIBS = -Wl,--start-group \1 -L${MXE_SYSROOT}/qt5/plugins/platforms -lqwindows -L${MXE_SYSROOT}/qt5/lib -lQt5Widgets -lQt5Gui -lQt5Network -lQt5Core -lQt5PlatformSupport -lQt5AccessibilitySupport -lQt5DeviceDiscoverySupport -lQt5EdidSupport -lQt5EventDispatcherSupport -lQt5FbSupport -lQt5FontDatabaseSupport -lQt5PlatformCompositorSupport -lQt5ThemeSupport -lQt5WindowsUIAutomationSupport -lharfbuzz -lfreetype -lharfbuzz_too -lfreetype_too -lbz2 -lpng16 -lbrotlidec -lbrotlicommon -lglib-2.0 -lintl -liconv -lpcre2-8 -lpcre2-16 -lzstd -lssl -lcrypto -ld3d11 -ldxgi -ldxguid -luxtheme -ldwmapi -ldnsapi -liphlpapi -lcrypt32 -lmpr -luserenv -lnetapi32 -lversion -lcomdlg32 -loleaut32 -limm32 -lshlwapi -latomic -lz -lws2_32 -lgdi32 -luser32 -lkernel32 -ladvapi32 -lole32 -lshell32 -luuid -lwinmm -lrpcrt4 -lssp -lwinspool -lcomctl32 -lwtsapi32 -lm -Wl,--end-group|" src/Makefile
 fi
 
 if [ -f src/univalue/Makefile ]; then
@@ -1890,7 +2154,7 @@ if [ -f src/Makefile ]; then
         libbitcoinconsensus_la-hash.lo \
         libbitcoinconsensus_la-pubkey.lo \
         libbitcoinconsensus_la-uint256.lo \
-        libbitcoinconsensus_la-utilstrencodings.lo \
+        util/libbitcoinconsensus_la-strencodings.lo \
         script/libbitcoinconsensus_la-script_error.lo \
         libbitcoinconsensus.la
 fi
@@ -1906,9 +2170,11 @@ ${HOST}-strip src/photond.exe 2>/dev/null || true
 ${HOST}-strip src/qt/photon-qt.exe 2>/dev/null || true
 ${HOST}-strip src/photon-cli.exe 2>/dev/null || true
 ${HOST}-strip src/photon-tx.exe 2>/dev/null || true
+${HOST}-strip src/photon-wallet.exe 2>/dev/null || true
+${HOST}-strip src/photon-util.exe 2>/dev/null || true
 
 echo ">>> Build complete!"
-ls -lh src/photond.exe src/qt/photon-qt.exe src/photon-cli.exe src/photon-tx.exe 2>/dev/null || true
+ls -lh src/photond.exe src/qt/photon-qt.exe src/photon-cli.exe src/photon-tx.exe src/photon-wallet.exe src/photon-util.exe 2>/dev/null || true
 '
 
     info "Starting build container: $container_name"
@@ -1917,14 +2183,16 @@ ls -lh src/photond.exe src/qt/photon-qt.exe src/photon-cli.exe src/photon-tx.exe
     # Extract binaries
     if [[ "$target" == "daemon" || "$target" == "both" ]]; then
         info "Extracting daemon binaries..."
-        docker cp "$container_name:/build/$COIN_NAME/src/photond.exe" "$output_dir/photond-${VERSION}.exe" 2>/dev/null || true
-        docker cp "$container_name:/build/$COIN_NAME/src/photon-cli.exe" "$output_dir/photon-cli-${VERSION}.exe" 2>/dev/null || true
-        docker cp "$container_name:/build/$COIN_NAME/src/photon-tx.exe" "$output_dir/photon-tx-${VERSION}.exe" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photond.exe" "$output_dir/photond-${VERSION}.exe" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photon-cli.exe" "$output_dir/photon-cli-${VERSION}.exe" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photon-tx.exe" "$output_dir/photon-tx-${VERSION}.exe" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photon-wallet.exe" "$output_dir/photon-wallet-${VERSION}.exe" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photon-util.exe" "$output_dir/photon-util-${VERSION}.exe" 2>/dev/null || true
     fi
 
     if [[ "$target" == "qt" || "$target" == "both" ]]; then
         info "Extracting Qt wallet..."
-        docker cp "$container_name:/build/$COIN_NAME/src/qt/photon-qt.exe" "$output_dir/photon-qt-${VERSION}.exe" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/qt/photon-qt.exe" "$output_dir/photon-qt-${VERSION}.exe" 2>/dev/null || true
     fi
 
     write_build_info "$output_dir" "windows" "$target" "Docker: $DOCKER_WINDOWS (MXE)"
@@ -1952,7 +2220,7 @@ build_macos_cross_legacy() {
     local target="$1"
     local jobs="$2"
     local docker_mode="$3"
-    local container_name="mac-${COIN_NAME}-0152-build"
+    local container_name="mac-${COIN_NAME}-0252-build"
     local output_dir=""
 
     echo ""
@@ -1980,18 +2248,18 @@ build_macos_cross_legacy() {
 
     local configure_extra=""
     case "$target" in
-        daemon) configure_extra="--without-gui" ;;
+        daemon) configure_extra="--with-gui=no" ;;
         qt)     configure_extra="--with-gui=qt5" ;;
         both)   configure_extra="--with-gui=qt5" ;;
     esac
 
     docker create \
         --name "$container_name" \
-        -v "$tmpdir:/build/$COIN_NAME:rw" \
+        -v "$tmpdir:/build/blakecoin:rw" \
         "$DOCKER_MACOS" \
         /bin/bash -c '
 set -e
-cd /build/'"$COIN_NAME"'
+cd /build/blakecoin
 
 # osxcross toolchain setup
 export PATH=/opt/osxcross/target/bin:$PATH
@@ -2007,7 +2275,7 @@ echo "    CC=${HOST}-clang"
 echo "    CXX=${HOST}-clang++"
 which ${HOST}-clang++ || { echo "ERROR: Cross-compiler not found"; exit 1; }
 
-# --- Cross-compile libevent (missing from osxcross-base, needed by 0.15.2) ---
+# --- Cross-compile libevent (missing from osxcross-base, needed by the legacy fallback path) ---
 echo ">>> Cross-compiling libevent..."
 cd /tmp
 curl -LO https://github.com/libevent/libevent/releases/download/release-2.1.12-stable/libevent-2.1.12-stable.tar.gz
@@ -2042,7 +2310,7 @@ make install
 echo ">>> protobuf installed to $PREFIX"
 
 # --- Build Photon ---
-cd /build/'"$COIN_NAME"'
+cd /build/blakecoin
 
 # Patch sources for Qt 5.15+ and Boost 1.73+ compatibility
 echo ">>> Patching sources..."
@@ -2107,7 +2375,7 @@ sed -i "/as_fn_error.*Could not resolve/s/as_fn_error/true #/" configure
 
 echo ">>> Configuring for macOS ($HOST)..."
 ./configure --host=$HOST --prefix=/usr/local \
-    --disable-tests --disable-bench --disable-zmq \
+    --disable-tests --disable-bench --disable-fuzz-binary --disable-zmq \
     --with-qt-plugindir=$PREFIX/qt5/plugins \
     --with-boost=$PREFIX \
     --with-boost-libdir=$PREFIX/lib \
@@ -2224,26 +2492,26 @@ fi
     # Extract binaries
     if [[ "$target" == "daemon" || "$target" == "both" ]]; then
         info "Extracting daemon binaries..."
-        docker cp "$container_name:/build/$COIN_NAME/src/photond" "$output_dir/photond-${VERSION}" 2>/dev/null || true
-        docker cp "$container_name:/build/$COIN_NAME/src/photon-cli" "$output_dir/photon-cli-${VERSION}" 2>/dev/null || true
-        docker cp "$container_name:/build/$COIN_NAME/src/photon-tx" "$output_dir/photon-tx-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photond" "$output_dir/photond-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photon-cli" "$output_dir/photon-cli-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photon-tx" "$output_dir/photon-tx-${VERSION}" 2>/dev/null || true
     fi
 
     if [[ "$target" == "qt" || "$target" == "both" ]]; then
         info "Extracting Qt wallet (.app bundle)..."
         local app_name="Photon-Qt.app"
         rm -rf "$output_dir/$app_name" 2>/dev/null || true
-        if docker cp "$container_name:/build/$COIN_NAME/$app_name" "$output_dir/$app_name" 2>/dev/null; then
+        if docker cp "$container_name:/build/blakecoin/$app_name" "$output_dir/$app_name" 2>/dev/null; then
             # Ensure binary inside .app is executable (docker cp can lose +x)
             find "$output_dir/$app_name" -path "*/Contents/MacOS/*" -type f -exec chmod +x {} + 2>/dev/null || true
             success "macOS app bundle extracted to $output_dir/"
             ls -lh "$output_dir/$app_name/Contents/MacOS/" 2>/dev/null || true
         else
             error "Could not find .app bundle in container"
-            docker exec "$container_name" find /build/$COIN_NAME -name "*.app" -type d 2>/dev/null || true
+            docker exec "$container_name" find /build/blakecoin -name "*.app" -type d 2>/dev/null || true
         fi
         # Also copy raw binary for convenience
-        docker cp "$container_name:/build/$COIN_NAME/src/qt/photon-qt" "$output_dir/photon-qt-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/qt/photon-qt" "$output_dir/photon-qt-${VERSION}" 2>/dev/null || true
     fi
 
     write_build_info "$output_dir" "macos" "$target" "Docker: $DOCKER_MACOS (osxcross)"
@@ -2270,11 +2538,12 @@ build_macos_cross() {
     local target="$1"
     local jobs="$2"
     local docker_mode="$3"
-    local container_name="mac-${COIN_NAME}-0152-build"
+    local container_name="mac-${COIN_NAME}-0252-build"
     local output_dir=""
     local tmpdir=""
     local build_strategy="${MACOS_CROSS_STRATEGY:-depends}"
     local build_note=""
+    local cache_root="${BLAKE_BUILD_CACHE_ROOT:-$SCRIPT_DIR/.build-cache}"
 
     if [[ "$build_strategy" == "legacy" ]]; then
         warn "Using legacy macOS cross-build path because MACOS_CROSS_STRATEGY=legacy"
@@ -2302,16 +2571,21 @@ build_macos_cross() {
     rm -rf "$tmpdir/release"
     clean_stale_build_artifacts "$tmpdir"
     fix_permissions "$tmpdir"
+    mkdir -p "$cache_root/macos-depends-built" "$cache_root/macos-depends-sources"
 
     docker create \
         --name "$container_name" \
         -e BLAKE_TARGET="$target" \
         -e BLAKE_JOBS="$jobs" \
-        -v "$tmpdir:/build/$COIN_NAME:rw" \
+        -e MACOS_FORCE_SYSTEM_CLANG="${MACOS_FORCE_SYSTEM_CLANG:-1}" \
+        -e MACOS_ENABLE_ZMQ="${MACOS_ENABLE_ZMQ:-1}" \
+        -v "$tmpdir:/build/blakecoin:rw" \
+        -v "$cache_root/macos-depends-built:/build/blakecoin/depends/built:rw" \
+        -v "$cache_root/macos-depends-sources:/build/blakecoin/depends/sources:rw" \
         "$DOCKER_MACOS" \
         /bin/bash -lc '
 set -euo pipefail
-cd /build/'"$COIN_NAME"'
+cd /build/blakecoin
 
 HOST="${OSXCROSS_HOST:-}"
 if [[ -z "$HOST" ]]; then
@@ -2331,6 +2605,10 @@ if [[ -z "$SDK_NAME" || ! -d "$SDK_ROOT/$SDK_NAME" ]]; then
     echo "ERROR: Could not locate macOS SDK under $SDK_ROOT"
     exit 1
 fi
+COMPAT_SDK_NAME="Xcode-12.2-12B45b-extracted-SDK-with-libcxx-headers"
+if [[ ! -e "$SDK_ROOT/$COMPAT_SDK_NAME" ]]; then
+    ln -s "$SDK_NAME" "$SDK_ROOT/$COMPAT_SDK_NAME"
+fi
 SDK_VERSION="${SDK_NAME#MacOSX}"
 SDK_VERSION="${SDK_VERSION%.sdk}"
 
@@ -2343,9 +2621,29 @@ fi
 DEPENDS_ARGS=()
 if [[ "$BLAKE_TARGET" == "daemon" ]]; then
     DEPENDS_ARGS+=(NO_QT=1)
-    CONFIGURE_EXTRA="--without-gui"
+    CONFIGURE_EXTRA="--with-gui=no"
 else
     CONFIGURE_EXTRA="--with-gui=qt5"
+fi
+
+if ! python3 -c "import setuptools" >/dev/null 2>&1; then
+    echo ">>> Installing Python setuptools for macOS native depends helpers..."
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-setuptools
+fi
+
+# Bitcoin Core 25.2 depends still uses the prebuilt LLVM 10 native_clang
+# package, which links against libtinfo.so.5. The current osxcross container is
+# Ubuntu 22.04 and no longer ships that ABI, so install the pinned Ubuntu 20.04
+# compatibility package inside the disposable build container.
+if ! ldconfig -p 2>/dev/null | grep -q "libtinfo.so.5"; then
+    echo ">>> Installing libtinfo5 compatibility package for macOS native_clang."
+    LIBTINFO5_URL="http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.2-0ubuntu2.1_amd64.deb"
+    LIBTINFO5_SHA256="d0f055e72d86aab0696cc993af790a78506419c18dc284cf04e7a7e96e0a7d7a"
+    LIBTINFO5_DEB="/tmp/libtinfo5_6.2-0ubuntu2.1_amd64.deb"
+    curl -fsSL "$LIBTINFO5_URL" -o "$LIBTINFO5_DEB"
+    echo "$LIBTINFO5_SHA256  $LIBTINFO5_DEB" | sha256sum -c -
+    DEBIAN_FRONTEND=noninteractive dpkg -i "$LIBTINFO5_DEB" >/dev/null
 fi
 
 echo ">>> depends environment:"
@@ -2356,6 +2654,24 @@ echo "    SDK_VERSION=$SDK_VERSION"
 echo "    LD64_VERSION=$LD64_VERSION"
 echo "    TARGET=$BLAKE_TARGET"
 
+DEPENDS_TOOLCHAIN_ARGS=()
+if [[ "${MACOS_FORCE_SYSTEM_CLANG:-1}" == "1" ]]; then
+    echo ">>> Using osxcross container clang for SDK 26.2 compatibility."
+    DEPENDS_TOOLCHAIN_ARGS+=(FORCE_USE_SYSTEM_CLANG=1)
+else
+    echo ">>> Using Bitcoin Core-style depends-managed clang/cctools for macOS."
+fi
+
+DEPENDS_ZMQ_ARGS=()
+CONFIGURE_ZMQ_EXTRA=""
+if [[ "${MACOS_ENABLE_ZMQ:-1}" == "1" ]]; then
+    echo ">>> Enabling ZMQ through macOS depends."
+else
+    echo ">>> Disabling ZMQ for macOS because MACOS_ENABLE_ZMQ=${MACOS_ENABLE_ZMQ:-0}."
+    DEPENDS_ZMQ_ARGS+=(NO_ZMQ=1)
+    CONFIGURE_ZMQ_EXTRA="--disable-zmq"
+fi
+
 echo ">>> Building depends..."
 make -C depends \
     HOST="$HOST" \
@@ -2363,11 +2679,8 @@ make -C depends \
     OSX_SDK_VERSION="$SDK_VERSION" \
     OSX_MIN_VERSION=11.0 \
     LD64_VERSION="$LD64_VERSION" \
-    darwin_native_toolchain= \
-    darwin_native_packages= \
-    build_CC=clang \
-    build_CXX=clang++ \
-    NO_ZMQ=1 \
+    "${DEPENDS_TOOLCHAIN_ARGS[@]}" \
+    "${DEPENDS_ZMQ_ARGS[@]}" \
     "${DEPENDS_ARGS[@]}" \
     -j"$BLAKE_JOBS"
 
@@ -2405,7 +2718,8 @@ OBJCXXFLAGS="${OBJCXXFLAGS:-} -Wno-enum-constexpr-conversion" \
     --prefix=/ \
     --disable-tests \
     --disable-bench \
-    --disable-zmq \
+    --disable-fuzz-binary \
+    $CONFIGURE_ZMQ_EXTRA \
     $CONFIGURE_EXTRA
 
 echo ">>> Building Photon..."
@@ -2419,13 +2733,17 @@ if [[ "$BLAKE_TARGET" == "qt" || "$BLAKE_TARGET" == "both" ]]; then
             -e "s/org.bitcoin.BitcoinPayment/org.photon.PhotonPayment/g" \
             -e "s/org.bitcoin.paymentrequest/org.photon.paymentrequest/g" \
             -e "s/Bitcoin payment request/Photon payment request/g" \
-            -e "s/application\/x-bitcoin-payment-request/application\/x-${COIN_NAME}-payment-request/g" \
+            -e "s/application\/x-bitcoin-payment-request/application\/x-photon-payment-request/g" \
             -e "s|<string>bitcoin</string>|<string>photon</string>|g" \
             share/qt/Info.plist
     fi
 
     echo ">>> Creating app bundle..."
-    make appbundle
+    make deploydir
+    if [[ -d dist/Bitcoin-Qt.app ]]; then
+        rm -rf Bitcoin-Qt.app
+        cp -a dist/Bitcoin-Qt.app Bitcoin-Qt.app
+    fi
 
     if [[ -d Bitcoin-Qt.app ]]; then
         rm -rf Photon-Qt.app
@@ -2449,22 +2767,22 @@ fi
 
     if [[ "$target" == "daemon" || "$target" == "both" ]]; then
         info "Extracting daemon binaries..."
-        docker cp "$container_name:/build/$COIN_NAME/src/photond" "$output_dir/photond-${VERSION}" 2>/dev/null || true
-        docker cp "$container_name:/build/$COIN_NAME/src/photon-cli" "$output_dir/photon-cli-${VERSION}" 2>/dev/null || true
-        docker cp "$container_name:/build/$COIN_NAME/src/photon-tx" "$output_dir/photon-tx-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photond" "$output_dir/photond-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photon-cli" "$output_dir/photon-cli-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photon-tx" "$output_dir/photon-tx-${VERSION}" 2>/dev/null || true
     fi
 
     if [[ "$target" == "qt" || "$target" == "both" ]]; then
         info "Extracting Qt wallet (.app bundle)..."
         rm -rf "$output_dir/Photon-Qt.app" 2>/dev/null || true
-        if docker cp "$container_name:/build/$COIN_NAME/Photon-Qt.app" "$output_dir/Photon-Qt.app" 2>/dev/null; then
+        if docker cp "$container_name:/build/blakecoin/Photon-Qt.app" "$output_dir/Photon-Qt.app" 2>/dev/null; then
             find "$output_dir/Photon-Qt.app" -path "*/Contents/MacOS/*" -type f -exec chmod +x {} + 2>/dev/null || true
             success "macOS app bundle extracted to $output_dir/"
         else
             error "Could not find Photon-Qt.app in container"
-            docker exec "$container_name" find /build/$COIN_NAME -maxdepth 2 -name "*.app" -type d 2>/dev/null || true
+            docker exec "$container_name" find /build/blakecoin -maxdepth 2 -name "*.app" -type d 2>/dev/null || true
         fi
-        docker cp "$container_name:/build/$COIN_NAME/src/qt/photon-qt" "$output_dir/photon-qt-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/qt/photon-qt" "$output_dir/photon-qt-${VERSION}" 2>/dev/null || true
     fi
 
     build_note="Docker: $DOCKER_MACOS (depends + CONFIG_SITE)"
@@ -2490,14 +2808,14 @@ fi
 build_appimage() {
     local jobs="$1"
     local docker_mode="$2"
-    local container_name="appimage-${COIN_NAME}-0152-build"
+    local container_name="appimage-${COIN_NAME}-0252-build"
     local output_dir
     output_dir="$(appimage_output_dir)"
     local appimage_path="$output_dir/${APPIMAGE_PUBLIC_NAME}"
 
     echo ""
     echo "============================================"
-    echo "  AppImage Build: $COIN_NAME_UPPER 0.15.21"
+    echo "  AppImage Build: $COIN_NAME_UPPER 0.25.2"
     echo "============================================"
     echo "  Image:  $DOCKER_APPIMAGE"
     echo ""
@@ -2519,11 +2837,11 @@ build_appimage() {
 
     docker create \
         --name "$container_name" \
-        -v "$tmpdir:/build/$COIN_NAME:rw" \
+        -v "$tmpdir:/build/blakecoin:rw" \
         "$DOCKER_APPIMAGE" \
         /bin/bash -c '
 set -e
-cd /build/'"$COIN_NAME"'
+cd /build/blakecoin
 
 # Patch sources for Qt 5.15+ and Boost 1.73+ compatibility
 echo ">>> Patching sources for modern Ubuntu compatibility..."
@@ -2538,7 +2856,7 @@ done
 
 echo ">>> Building Qt wallet with autotools..."
 ./autogen.sh
-./configure --disable-tests --disable-bench --enable-upnp-default \
+./configure --disable-tests --disable-bench --disable-fuzz-binary --enable-upnp-default \
     CXXFLAGS="-O2 -DBOOST_BIND_GLOBAL_PLACEHOLDERS" LDFLAGS="-static-libstdc++"
 
 # Fix missing Qt translation files (Photon fork does not include them)
@@ -2700,12 +3018,13 @@ cat > "$APPDIR/'"$COIN_NAME"'.desktop" << '\''DESKTOP_EOF'\''
 [Desktop Entry]
 Type=Application
 Name='"$COIN_NAME_UPPER"'
-Comment='"$COIN_NAME_UPPER"' 0.15.21 Cryptocurrency Wallet
+Comment='"$COIN_NAME_UPPER"' 0.25.2 Cryptocurrency Wallet
 Exec='"$QT_NAME"'
 Icon='"$COIN_NAME"'
 Categories=Network;Finance;
 Terminal=false
-StartupWMClass='"$QT_NAME"'
+StartupNotify=true
+StartupWMClass='"$QT_WM_CLASS"'
 DESKTOP_EOF
 mkdir -p "$APPDIR/usr/share/applications"
 cp "$APPDIR/'"$COIN_NAME"'.desktop" "$APPDIR/usr/share/applications/"
@@ -2760,6 +3079,7 @@ Name=$_COIN_NAME
 Icon=$_ICON_DST
 Exec=$_APPIMAGE_PATH
 Terminal=false
+StartupNotify=true
 Categories=Finance;Network;
 StartupWMClass=$_WM_CLASS
 _DEOF
@@ -2773,8 +3093,8 @@ chmod +x "$APPDIR/AppRun"
 echo ">>> Creating AppImage..."
 mkdir -p /build/output
 ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 appimagetool --no-appstream "$APPDIR" \
-    "/build/output/'"$COIN_NAME_UPPER"'-0.15.21-x86_64.AppImage"
-chmod +x "/build/output/'"$COIN_NAME_UPPER"'-0.15.21-x86_64.AppImage"
+    "/build/output/'"$COIN_NAME_UPPER"'-0.25.2-x86_64.AppImage"
+chmod +x "/build/output/'"$COIN_NAME_UPPER"'-0.25.2-x86_64.AppImage"
 
 echo ">>> AppImage build complete!"
 ls -lh /build/output/
@@ -2805,7 +3125,7 @@ ls -lh /build/output/
     echo "  BUILD SUCCESSFUL  -  AppImage"
     echo "  Output: $appimage_path"
     echo "  Note:   Ubuntu 22.04.5 direct launch needs libfuse2"
-    echo "          Ubuntu 24.04.4 / 25.10 direct launch needs libfuse2t64"
+    echo "          Ubuntu 24.04.4 / 26.04 direct launch needs libfuse2t64"
     echo "          Otherwise use --appimage-extract-and-run"
     echo "============================================"
 }
@@ -2826,7 +3146,7 @@ build_native_docker() {
 
     echo ""
     echo "============================================"
-    echo "  Native Docker Build: $COIN_NAME_UPPER 0.15.21"
+    echo "  Native Docker Build: $COIN_NAME_UPPER 0.25.2"
     echo "============================================"
     echo "  Image:  $DOCKER_NATIVE"
     echo "  Target: $target"
@@ -2852,21 +3172,57 @@ build_native_docker() {
 
     local configure_extra=""
     case "$target" in
-        daemon) configure_extra="--without-gui" ;;
+        daemon) configure_extra="--with-gui=no" ;;
         qt)     configure_extra="--with-gui=qt5" ;;
         both)   configure_extra="--with-gui=qt5" ;;
     esac
+    if [[ "$ENABLE_SQLITE" == "1" || "$ENABLE_SQLITE" == "true" || "$ENABLE_SQLITE" == "yes" ]]; then
+        configure_extra="$configure_extra --with-sqlite=yes"
+    fi
+    if is_enabled "$ENABLE_ZMQ"; then
+        configure_extra="$configure_extra --enable-zmq"
+    else
+        configure_extra="$configure_extra --disable-zmq"
+    fi
+    if is_enabled "$ENABLE_USDT"; then
+        configure_extra="$configure_extra --enable-usdt"
+    else
+        configure_extra="$configure_extra --disable-usdt"
+    fi
 
-    local container_name="${NATIVE_CONTAINER_NAME:-native-${COIN_NAME}-0152-build}"
+    local container_name="${NATIVE_CONTAINER_NAME:-native-${COIN_NAME}-0252-build}"
     docker rm -f "$container_name" 2>/dev/null || true
 
     docker create \
         --name "$container_name" \
-        -v "$tmpdir:/build/$COIN_NAME:rw" \
+        -e BLAKE_ENABLE_SQLITE="$ENABLE_SQLITE" \
+        -e BLAKE_ENABLE_ZMQ="$ENABLE_ZMQ" \
+        -e BLAKE_ENABLE_USDT="$ENABLE_USDT" \
+        -e BLAKE_NATIVE_EXTRA_APT="$install_packages" \
+        -v "$tmpdir:/build/blakecoin:rw" \
         "$DOCKER_NATIVE" \
         /bin/bash -c '
 set -e
-cd /build/'"$COIN_NAME"'
+cd /build/blakecoin
+
+	is_enabled() {
+	    case "${1:-0}" in
+	        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+	        *) return 1 ;;
+	    esac
+	}
+
+	if [ -n "${BLAKE_NATIVE_EXTRA_APT:-}" ]; then
+	    missing_pkgs=""
+	    for pkg in $BLAKE_NATIVE_EXTRA_APT; do
+	        dpkg -s "$pkg" >/dev/null 2>&1 || missing_pkgs="$missing_pkgs $pkg"
+	    done
+	    if [ -n "$missing_pkgs" ]; then
+	        echo ">>> Installing missing native release packages:$missing_pkgs"
+	        apt-get update -qq
+	        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $missing_pkgs
+	    fi
+	fi
 
 # Patch sources for Qt 5.15+ and Boost 1.73+ compatibility
 echo ">>> Patching sources for modern Ubuntu compatibility..."
@@ -2887,8 +3243,21 @@ echo ">>> Running autogen.sh..."
 ./autogen.sh
 
 echo ">>> Configuring..."
-./configure --disable-tests --disable-bench '"$configure_extra"' \
+./configure --disable-tests --disable-bench --disable-fuzz-binary '"$configure_extra"' \
     CXXFLAGS="-O2 -DBOOST_BIND_GLOBAL_PLACEHOLDERS"
+
+	if is_enabled "$BLAKE_ENABLE_SQLITE" && ! grep -q "^USE_SQLITE=true$" test/config.ini; then
+	    echo "ERROR: SQLite was requested but USE_SQLITE=true is absent from test/config.ini"
+	    exit 1
+	fi
+	if is_enabled "$BLAKE_ENABLE_ZMQ" && ! grep -q "^ENABLE_ZMQ=true$" test/config.ini; then
+	    echo "ERROR: ZMQ was requested but ENABLE_ZMQ=true is absent from test/config.ini"
+	    exit 1
+	fi
+	if is_enabled "$BLAKE_ENABLE_USDT" && ! grep -q "^ENABLE_USDT_TRACEPOINTS=true$" test/config.ini; then
+	    echo "ERROR: USDT was requested but ENABLE_USDT_TRACEPOINTS=true is absent from test/config.ini"
+	    exit 1
+	fi
 
 # Fix missing Qt translation files (Photon fork does not include them)
 if [ -f src/Makefile ]; then
@@ -2912,9 +3281,11 @@ strip src/photond 2>/dev/null || true
 strip src/qt/photon-qt 2>/dev/null || true
 strip src/photon-cli 2>/dev/null || true
 strip src/photon-tx 2>/dev/null || true
+strip src/photon-wallet 2>/dev/null || true
+strip src/photon-util 2>/dev/null || true
 
 echo ">>> Build complete!"
-ls -lh src/photond src/qt/photon-qt src/photon-cli src/photon-tx 2>/dev/null || true
+ls -lh src/photond src/qt/photon-qt src/photon-cli src/photon-tx src/photon-wallet src/photon-util 2>/dev/null || true
 '
 
     info "Starting build container: $container_name"
@@ -2923,14 +3294,16 @@ ls -lh src/photond src/qt/photon-qt src/photon-cli src/photon-tx 2>/dev/null || 
     # Extract binaries
     if [[ "$target" == "daemon" || "$target" == "both" ]]; then
         info "Extracting daemon binaries..."
-        docker cp "$container_name:/build/$COIN_NAME/src/photond" "$daemon_stage/photond-${VERSION}" 2>/dev/null || true
-        docker cp "$container_name:/build/$COIN_NAME/src/photon-cli" "$daemon_stage/photon-cli-${VERSION}" 2>/dev/null || true
-        docker cp "$container_name:/build/$COIN_NAME/src/photon-tx" "$daemon_stage/photon-tx-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photond" "$daemon_stage/photond-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photon-cli" "$daemon_stage/photon-cli-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photon-tx" "$daemon_stage/photon-tx-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photon-wallet" "$daemon_stage/photon-wallet-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/photon-util" "$daemon_stage/photon-util-${VERSION}" 2>/dev/null || true
     fi
 
     if [[ "$target" == "qt" || "$target" == "both" ]]; then
         info "Extracting Qt wallet..."
-        docker cp "$container_name:/build/$COIN_NAME/src/qt/photon-qt" "$qt_stage/photon-qt-${VERSION}" 2>/dev/null || true
+        docker cp "$container_name:/build/blakecoin/src/qt/photon-qt" "$qt_stage/photon-qt-${VERSION}" 2>/dev/null || true
     fi
 
     finalize_linux_native_output \
@@ -2943,6 +3316,12 @@ ls -lh src/photond src/qt/photon-qt src/photon-cli src/photon-tx 2>/dev/null || 
         "$install_packages"
 
     final_output_dir="$(linux_output_dir "$ubuntu_ver")"
+    docker cp "$container_name:/build/blakecoin/test/config.ini" "$final_output_dir/test-config.ini" 2>/dev/null || warn "Missing native Docker test/config.ini"
+    docker cp "$container_name:/build/blakecoin/config.log" "$final_output_dir/config.log" 2>/dev/null || warn "Missing native Docker config.log"
+    if [[ "$target" == "daemon" || "$target" == "both" ]]; then
+        cp "$daemon_stage/photon-wallet-${VERSION}" "$final_output_dir/$WALLET_NAME" 2>/dev/null || warn "Missing Linux wallet tool artifact: $daemon_stage/photon-wallet-${VERSION}"
+        cp "$daemon_stage/photon-util-${VERSION}" "$final_output_dir/$UTIL_NAME" 2>/dev/null || warn "Missing Linux util tool artifact: $daemon_stage/photon-util-${VERSION}"
+    fi
 
     docker rm -f "$container_name" 2>/dev/null || true
     docker run --rm -v "$tmpdir:/cleanup" alpine rm -rf /cleanup 2>/dev/null || rm -rf "$tmpdir" 2>/dev/null || true
@@ -2981,7 +3360,7 @@ build_native_linux_direct() {
 
     echo ""
     echo "============================================"
-    echo "  Native Linux Build: $COIN_NAME_UPPER 0.15.21"
+    echo "  Native Linux Build: $COIN_NAME_UPPER 0.25.2"
     echo "============================================"
     echo ""
 
@@ -3017,12 +3396,15 @@ build_native_linux_direct() {
 
     local configure_extra=""
     case "$target" in
-        daemon) configure_extra="--without-gui" ;;
+        daemon) configure_extra="--with-gui=no" ;;
         qt)     configure_extra="--with-gui=qt5" ;;
         both)   configure_extra="--with-gui=qt5" ;;
     esac
 
     cd "$SCRIPT_DIR"
+    info "Removing stale native build artifacts..."
+    rm -f config.status config.log config.cache libtool
+    clean_stale_build_artifacts "$SCRIPT_DIR/src"
 
     # Patch sources for Qt 5.15+ and Boost 1.73+ compatibility
     if [[ -f src/qt/trafficgraphwidget.cpp ]]; then
@@ -3049,7 +3431,7 @@ build_native_linux_direct() {
     fi
 
     info "Configuring..."
-    ./configure --disable-tests --disable-bench $configure_extra \
+    ./configure --disable-tests --disable-bench --disable-fuzz-binary $configure_extra \
         BDB_CFLAGS="-I$linux_bdb_prefix/include" \
         BDB_LIBS="-L$linux_bdb_prefix/lib -ldb_cxx-4.8 -ldb-4.8" \
         CXXFLAGS="-O2 -DBOOST_BIND_GLOBAL_PLACEHOLDERS"
@@ -3069,13 +3451,30 @@ build_native_linux_direct() {
 QRC_EOF
 
     info "Building with $jobs jobs..."
-    make -j"$jobs"
+    if ! make -j"$jobs"; then
+        warn "Native make failed; retrying serially to recover from transient compiler frontend crashes."
+        make_retry_ok=0
+        for make_retry in 1 2 3 4 5; do
+            warn "Serial make retry ${make_retry}/5..."
+            if make -j1; then
+                make_retry_ok=1
+                break
+            fi
+            sleep 2
+        done
+        if [[ "$make_retry_ok" != "1" ]]; then
+            error "Build failed after serial make retries."
+            exit 1
+        fi
+    fi
 
     if [[ "$target" == "daemon" || "$target" == "both" ]]; then
         info "Relinking native Linux daemon tools against Berkeley DB 4.8..."
         relink_native_linux_target "photond" "$SCRIPT_DIR/src/photond"
         relink_native_linux_target "photon-cli" "$SCRIPT_DIR/src/photon-cli"
         relink_native_linux_target "photon-tx" "$SCRIPT_DIR/src/photon-tx"
+        relink_native_linux_target "photon-wallet" "$SCRIPT_DIR/src/photon-wallet"
+        relink_native_linux_target "photon-util" "$SCRIPT_DIR/src/photon-util"
     fi
 
     if [[ "$target" == "qt" || "$target" == "both" ]]; then
@@ -3084,7 +3483,7 @@ QRC_EOF
     fi
 
     if [[ "$target" == "daemon" || "$target" == "both" ]]; then
-        strip src/photond src/photon-cli src/photon-tx 2>/dev/null || true
+        strip src/photond src/photon-cli src/photon-tx src/photon-wallet src/photon-util 2>/dev/null || true
     fi
 
     if [[ "$target" == "qt" || "$target" == "both" ]]; then
@@ -3101,6 +3500,12 @@ QRC_EOF
         "$install_packages"
 
     final_output_dir="$(linux_output_dir "$ubuntu_ver")"
+    cp "$SCRIPT_DIR/test/config.ini" "$final_output_dir/test-config.ini" 2>/dev/null || warn "Missing native test/config.ini"
+    cp "$SCRIPT_DIR/config.log" "$final_output_dir/config.log" 2>/dev/null || warn "Missing native config.log"
+    if [[ "$target" == "daemon" || "$target" == "both" ]]; then
+        cp "$SCRIPT_DIR/src/photon-wallet" "$final_output_dir/$WALLET_NAME" 2>/dev/null || warn "Missing Linux wallet tool artifact: $SCRIPT_DIR/src/photon-wallet"
+        cp "$SCRIPT_DIR/src/photon-util" "$final_output_dir/$UTIL_NAME" 2>/dev/null || warn "Missing Linux util tool artifact: $SCRIPT_DIR/src/photon-util"
+    fi
 
     if [[ "$target" == "qt" || "$target" == "both" ]]; then
         install_linux_desktop_launcher "$final_output_dir"
@@ -3127,28 +3532,36 @@ build_native_macos() {
 
     echo ""
     echo "============================================"
-    echo "  Native macOS Build: $COIN_NAME_UPPER 0.15.21"
+    echo "  Native macOS Build: $COIN_NAME_UPPER 0.25.2"
     echo "============================================"
     echo ""
 
     ensure_macos_homebrew
 
+    if is_enabled "$ENABLE_USDT"; then
+        warn "USDT tracing is Linux/eBPF-only for release artifacts; disabling it for native macOS."
+        ENABLE_USDT=0
+    fi
+
     # Check/install dependencies
-    local deps=(openssl@3 boost miniupnpc berkeley-db@4 qt@5 libevent pkg-config automake autoconf libtool curl)
+    local deps=(openssl@3 boost miniupnpc berkeley-db@4 qt@5 libevent sqlite zeromq pkg-config automake autoconf libtool m4 curl)
     for dep in "${deps[@]}"; do
         if ! brew list "$dep" &>/dev/null; then
             info "Installing $dep..."
             HOMEBREW_NO_AUTO_UPDATE=1 brew install "$dep"
         fi
     done
+    ensure_macos_brew_env
 
-    local openssl_prefix boost_prefix bdb_prefix qt5_prefix libevent_prefix miniupnpc_prefix
+    local openssl_prefix boost_prefix bdb_prefix qt5_prefix libevent_prefix miniupnpc_prefix sqlite_prefix zmq_prefix
     openssl_prefix=$(brew --prefix openssl@3)
     boost_prefix=$(brew --prefix boost)
     bdb_prefix=$(brew --prefix berkeley-db@4)
     qt5_prefix=$(brew --prefix qt@5)
     libevent_prefix=$(brew --prefix libevent)
     miniupnpc_prefix=$(brew --prefix miniupnpc)
+    sqlite_prefix=$(brew --prefix sqlite)
+    zmq_prefix=$(brew --prefix zeromq)
 
     verify_bdb48_prefix "$bdb_prefix" "Native macOS Homebrew Berkeley DB" || return 1
 
@@ -3158,10 +3571,18 @@ build_native_macos() {
 
     local configure_extra=""
     case "$target" in
-        daemon) configure_extra="--without-gui" ;;
+        daemon) configure_extra="--with-gui=no" ;;
         qt)     configure_extra="--with-gui=qt5" ;;
         both)   configure_extra="--with-gui=qt5" ;;
     esac
+    if [[ "$ENABLE_SQLITE" == "1" || "$ENABLE_SQLITE" == "true" || "$ENABLE_SQLITE" == "yes" ]]; then
+        configure_extra="$configure_extra --with-sqlite=yes"
+    fi
+    if is_enabled "$ENABLE_ZMQ"; then
+        configure_extra="$configure_extra --enable-zmq"
+    else
+        configure_extra="$configure_extra --disable-zmq"
+    fi
 
     if [[ "$target" == "qt" || "$target" == "both" ]]; then
         protobuf_prefix="$native_dep_root/protobuf-${protobuf_version}"
@@ -3183,9 +3604,9 @@ build_native_macos() {
         export PATH="$qt5_prefix/bin:$PATH"
     fi
 
-    local pkg_config_path="$openssl_prefix/lib/pkgconfig:$qt5_prefix/lib/pkgconfig:$libevent_prefix/lib/pkgconfig:$miniupnpc_prefix/lib/pkgconfig"
-    local cppflags="-I$bdb_prefix/include -I$boost_prefix/include -I$openssl_prefix/include -I$miniupnpc_prefix/include -I$libevent_prefix/include"
-    local ldflags="-L$bdb_prefix/lib -L$boost_prefix/lib -L$openssl_prefix/lib -L$miniupnpc_prefix/lib -L$libevent_prefix/lib"
+    local pkg_config_path="$openssl_prefix/lib/pkgconfig:$qt5_prefix/lib/pkgconfig:$libevent_prefix/lib/pkgconfig:$miniupnpc_prefix/lib/pkgconfig:$sqlite_prefix/lib/pkgconfig:$zmq_prefix/lib/pkgconfig"
+    local cppflags="-I$bdb_prefix/include -I$boost_prefix/include -I$openssl_prefix/include -I$miniupnpc_prefix/include -I$libevent_prefix/include -I$sqlite_prefix/include -I$zmq_prefix/include"
+    local ldflags="-L$bdb_prefix/lib -L$boost_prefix/lib -L$openssl_prefix/lib -L$miniupnpc_prefix/lib -L$libevent_prefix/lib -L$sqlite_prefix/lib -L$zmq_prefix/lib"
     local protoc_bin=""
     configure_extra="$configure_extra --with-boost=$boost_prefix --with-boost-libdir=$boost_prefix/lib"
     if [[ -n "$protobuf_prefix" ]]; then
@@ -3196,6 +3617,9 @@ build_native_macos() {
     fi
 
     cd "$SCRIPT_DIR"
+    info "Removing stale native build artifacts..."
+    rm -f config.status config.log config.cache libtool
+    clean_stale_build_artifacts "$SCRIPT_DIR/src"
 
     # Modern Homebrew Boost can ship Boost.System as a header-only component,
     # so the legacy AX_BOOST_SYSTEM macro must not hard-fail on a missing
@@ -3242,7 +3666,7 @@ PY
     done < <(grep -rl "boost::bind" src/ 2>/dev/null | grep '\.cpp$' || true)
 
     info "Configuring..."
-    ./configure --disable-tests --disable-bench --disable-zmq $configure_extra \
+    ./configure --disable-tests --disable-bench --disable-fuzz-binary $configure_extra \
         CXXFLAGS="-O2 -DBOOST_BIND_GLOBAL_PLACEHOLDERS -Wno-enum-constexpr-conversion" \
         OBJCXXFLAGS="-O2 -Wno-enum-constexpr-conversion" \
         PKG_CONFIG_PATH="$pkg_config_path" \
@@ -3251,6 +3675,7 @@ PY
         BDB_CFLAGS="-I$bdb_prefix/include" \
         BDB_LIBS="-L$bdb_prefix/lib -ldb_cxx-4.8 -ldb-4.8" \
         PROTOC="$protoc_bin"
+    verify_native_feature_config "$SCRIPT_DIR/test/config.ini"
 
     # Fix missing Qt translation files (Photon fork does not include them)
     if [[ -f src/Makefile ]]; then
@@ -3282,13 +3707,30 @@ PY
 QRC_EOF
 
     info "Building with $jobs jobs..."
-    make -j"$jobs"
+    if ! make -j"$jobs"; then
+        warn "Native make failed; retrying serially to recover from transient compiler frontend crashes."
+        make_retry_ok=0
+        for make_retry in 1 2 3 4 5; do
+            warn "Serial make retry ${make_retry}/5..."
+            if make -j1; then
+                make_retry_ok=1
+                break
+            fi
+            sleep 2
+        done
+        if [[ "$make_retry_ok" != "1" ]]; then
+            error "Build failed after serial make retries."
+            exit 1
+        fi
+    fi
 
     if [[ "$target" == "daemon" || "$target" == "both" ]]; then
-        strip src/photond src/photon-cli src/photon-tx 2>/dev/null || true
+        strip src/photond src/photon-cli src/photon-tx src/photon-wallet src/photon-util 2>/dev/null || true
         cp src/photond "$output_dir/photond-${VERSION}"
         cp src/photon-cli "$output_dir/photon-cli-${VERSION}"
         cp src/photon-tx "$output_dir/photon-tx-${VERSION}"
+        cp src/photon-wallet "$output_dir/photon-wallet-${VERSION}"
+        cp src/photon-util "$output_dir/photon-util-${VERSION}"
         success "Daemon binaries in $output_dir/"
     fi
 
@@ -3365,6 +3807,8 @@ PLIST_EOF
     fi
 
     write_build_info "$output_dir" "native-macos" "$target" "$(detect_os_version macos)"
+    cp "$SCRIPT_DIR/test/config.ini" "$output_dir/test-config.ini" 2>/dev/null || warn "Missing native macOS test/config.ini"
+    cp "$SCRIPT_DIR/config.log" "$output_dir/config.log" 2>/dev/null || warn "Missing native macOS config.log"
     CURRENT_OUTPUT_DIR="$output_dir"
     GENERATE_CONFIG_AFTER_BUILD=1
 
@@ -3414,7 +3858,7 @@ build_native_windows() {
 
     echo ""
     echo "============================================"
-    echo "  Native Windows Build: $COIN_NAME_UPPER 0.15.21"
+    echo "  Native Windows Build: $COIN_NAME_UPPER 0.25.2"
     echo "============================================"
     echo ""
 
@@ -3479,7 +3923,7 @@ build_native_windows() {
 
     local configure_extra=""
     case "$target" in
-        daemon) configure_extra="--without-gui" ;;
+        daemon) configure_extra="--with-gui=no" ;;
         qt)     configure_extra="--with-gui=qt5" ;;
         both)   configure_extra="--with-gui=qt5" ;;
     esac
@@ -3507,6 +3951,9 @@ build_native_windows() {
     configure_extra="$configure_extra --with-boost-chrono=boost_chrono-mt"
 
     cd "$SCRIPT_DIR"
+    info "Removing stale native build artifacts..."
+    rm -f config.status config.log config.cache libtool
+    clean_stale_build_artifacts "$SCRIPT_DIR/src"
     normalize_windows_source_timestamps
 
     # Patch sources for Qt 5.15+ and Boost 1.73+ compatibility
@@ -3598,13 +4045,13 @@ PY
     fi
 
     info "Configuring..."
-    ./configure --disable-tests --disable-bench $configure_extra \
+    ./configure --disable-tests --disable-bench --disable-fuzz-binary $configure_extra \
         BDB_CFLAGS="-I$windows_bdb_prefix/include" \
         BDB_LIBS="-L$windows_bdb_prefix/lib -ldb_cxx-4.8 -ldb-4.8" \
         CFLAGS="$windows_cflags" \
         CXXFLAGS="$windows_cxxflags"
 
-    # Photon 0.15.21 does not ship the upstream translation payloads.
+    # Photon 0.25.2 does not ship the upstream translation payloads.
     if [[ -f src/Makefile ]]; then
         sedi 's/^QT_QM.*=.*/QT_QM =/' src/Makefile
         sedi '/bitcoin_.*\.qm/d' src/Makefile
@@ -3755,6 +4202,7 @@ main() {
             --pull-docker)  docker_mode="pull" ;;
             --build-docker) docker_mode="build" ;;
             --no-docker)    docker_mode="none" ;;
+            --hardened-release) HARDENED_RELEASE=1 ;;
             --jobs)         shift; jobs="$1" ;;
             -h|--help)      usage ;;
             *)              error "Unknown option: $1"; usage ;;
@@ -3767,6 +4215,7 @@ main() {
         echo ""
         usage
     fi
+    apply_build_profile
 
     # Cross-compile platforms require Docker
     if [[ "$platform" =~ ^(windows|macos|appimage)$ && "$docker_mode" == "none" ]]; then
@@ -3780,12 +4229,16 @@ main() {
 
     echo ""
     echo "============================================"
-    echo "  $COIN_NAME_UPPER 0.15.21 Build System"
+    echo "  $COIN_NAME_UPPER 0.25.2 Build System"
     echo "============================================"
     echo "  Platform: $platform"
     echo "  Target:   $target"
     echo "  Docker:   $docker_mode"
     echo "  Jobs:     $jobs"
+    echo "  Profile:  $(build_profile_name)"
+    echo "  SQLite:   $(feature_status "$ENABLE_SQLITE")"
+    echo "  ZMQ:      $(feature_status "$ENABLE_ZMQ")"
+    echo "  USDT:     $(feature_status "$ENABLE_USDT")"
     echo ""
 
     case "$platform" in
