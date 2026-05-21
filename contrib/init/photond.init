@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+#
+#  photond The Photon Core server.
+#
+#
+# chkconfig: 345 80 20
+# description: photond
+# processname: photond
+#
+
+# Source function library.
+. /etc/init.d/functions
+
+# you can override defaults in /etc/sysconfig/photond, see below
+if [ -f /etc/sysconfig/photond ]; then
+        . /etc/sysconfig/photond
+fi
+
+RETVAL=0
+
+prog=photond
+# you can override the lockfile via PHOTOND_LOCKFILE in /etc/sysconfig/photond
+lockfile=${PHOTOND_LOCKFILE-/var/lock/subsys/photond}
+
+# photond defaults to /usr/bin/photond, override with PHOTOND_BIN
+photond=${PHOTOND_BIN-/usr/bin/photond}
+
+# photond opts default to -disablewallet, override with PHOTOND_OPTS
+photond_opts=${PHOTOND_OPTS--disablewallet}
+
+start() {
+    echo -n $"Starting $prog: "
+    daemon $DAEMONOPTS $photond $photond_opts
+    RETVAL=$?
+    echo
+    [ $RETVAL -eq 0 ] && touch $lockfile
+    return $RETVAL
+}
+
+stop() {
+    echo -n $"Stopping $prog: "
+    killproc $prog -t600
+    RETVAL=$?
+    echo
+    [ $RETVAL -eq 0 ] && rm -f $lockfile
+    return $RETVAL
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    status)
+        status $prog
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    *)
+        echo "Usage: service $prog {start|stop|status|restart}"
+        exit 1
+        ;;
+esac
