@@ -10,6 +10,7 @@
 
 #include <arith_uint256.h>
 #include <chain.h>
+#include <chainparamsbase.h>
 #include <checkqueue.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
@@ -1931,8 +1932,14 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
     // Note: the blocks specified here are different than the ones used in ConnectBlock because DisconnectBlock
     // unwinds the blocks in reverse. As a result, the inconsistency is not discovered until the earlier
     // blocks with the duplicate coinbase transactions are disconnected.
-    bool fEnforceBIP30 = !((pindex->nHeight==91722 && pindex->GetBlockHash() == uint256S("0x00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e")) ||
-                           (pindex->nHeight==91812 && pindex->GetBlockHash() == uint256S("0x00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f")));
+    // Photon 0.15.21 only enforced BIP30 overwrite checks for new block/template
+    // contexts, so accepted historical mainnet data before the scheduled BIP34
+    // cleanup height must replay without retroactive Bitcoin-style BIP30 checks.
+    // Testnet/regtest remain strict and BIP30 is enforced from BIP34Height.
+    const bool legacy_mainnet_pre_bip34 = m_chainman.GetParams().NetworkIDString() == CBaseChainParams::MAIN &&
+                                          pindex->nHeight > 0 &&
+                                          pindex->nHeight < m_chainman.GetParams().GetConsensus().BIP34Height;
+    bool fEnforceBIP30 = !legacy_mainnet_pre_bip34 && !IsBIP30Unspendable(*pindex);
 
     // undo transactions in reverse order
     for (int i = block.vtx.size() - 1; i >= 0; i--) {
@@ -2181,7 +2188,12 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // Now that the whole chain is irreversibly beyond that time it is applied to all blocks except the
     // two in the chain that violate it. This prevents exploiting the issue against nodes during their
     // initial block download.
-    bool fEnforceBIP30 = !IsBIP30Repeat(*pindex);
+    // Preserve legacy Photon mainnet replay before the scheduled BIP34 cleanup
+    // height while keeping testnet/regtest and post-cleanup BIP30 checks strict.
+    const bool legacy_mainnet_pre_bip34 = params.NetworkIDString() == CBaseChainParams::MAIN &&
+                                          pindex->nHeight > 0 &&
+                                          pindex->nHeight < params.GetConsensus().BIP34Height;
+    bool fEnforceBIP30 = !legacy_mainnet_pre_bip34 && !IsBIP30Repeat(*pindex);
 
     // Once BIP34 activated it was not possible to create new duplicate coinbases and thus other than starting
     // with the 2 existing duplicate coinbase pairs, not possible to create overwriting txs.  But by the
@@ -2246,7 +2258,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // TODO: Remove BIP30 checking from block height 1,983,702 on, once we have a
     // consensus change that ensures coinbases at those heights cannot
     // duplicate earlier coinbases.
-    if (fEnforceBIP30 || pindex->nHeight >= BIP34_IMPLIES_BIP30_LIMIT) {
+    if (!legacy_mainnet_pre_bip34 && (fEnforceBIP30 || pindex->nHeight >= BIP34_IMPLIES_BIP30_LIMIT)) {
         for (const auto& tx : block.vtx) {
             for (size_t o = 0; o < tx->vout.size(); o++) {
                 if (view.HaveCoin(COutPoint(tx->GetHash(), o))) {
