@@ -18,6 +18,7 @@ import time
 import glob
 from collections import namedtuple
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'test', 'functional'))
 from blake256 import blake256_hash
 
 settings = {}

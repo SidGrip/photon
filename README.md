@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="src/qt/res/icons/bitcoin.png" alt="Photon" width="95">
+  <img src="src/qt/res/icons/photon.png" alt="Photon" width="95">
 </p>
 
 # Photon Core 0.25.2
