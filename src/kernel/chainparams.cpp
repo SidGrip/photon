@@ -98,7 +98,9 @@ public:
         // Photon SegWit is inherited from the 0.15.21 mainnet activation.
         // 0.25.2 buries this height and does not re-signal SegWit.
         consensus.SegwitHeight = 2051160;
-        consensus.MinBIP9WarningHeight = 0;
+        // Suppress historical pre-burial unknown bit 4 warnings from old
+        // AuxPoW/version reuse. Future warnings remain enabled from SegWit on.
+        consensus.MinBIP9WarningHeight = 2051160;
         consensus.powLimit = uint256S("000000ffff000000000000000000000000000000000000000000000000000000");
         consensus.nPowTargetTimespan = 20 * 3 * 60;
         consensus.nPowTargetSpacing = 3 * 60;
@@ -123,8 +125,8 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = 1814407200;
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 2075587;
 
-        consensus.nMinimumChainWork = uint256S("0x00000000000000000000000000000000000000000000008781d8720f0618633a");
-        consensus.defaultAssumeValid = uint256S("0xd58aac5395970447777021d84469cc060998732480db912167efdd43a0da2139");
+        consensus.nMinimumChainWork = uint256S("0x000000000000000000000000000000000000000000000087ac0e7d8c0ad5852a");
+        consensus.defaultAssumeValid = uint256S("0x6e1317a14c360e184284e91f202300859386864d6e630bbad363dbb3ab159f37");
 
         // Photon AuxPoW chain identity (consumed by Phase 2 AuxPoW core).
         // mainnet: strict chain-ID, AuxPoW activates at historical height 160000.
@@ -171,9 +173,8 @@ public:
         m_is_test_chain = false;
         m_is_mockable_chain = false;
 
-        // Photon mainnet checkpoints, lifted from Photon-0.15.21
-        // chainparams.cpp:168-188. 16 entries, genesis through height
-        // 1,346,300.
+        // Photon mainnet checkpoints, lifted from Photon-0.15.21 and extended
+        // from the live 0.25.2 mainnet chain.
         checkpointData = {
             {
                 {0,       uint256S("0x000000e79a20d718a2f2d8b98161dc6700104a22d8e9be70e8ac361ee6664b9c")},
@@ -196,6 +197,9 @@ public:
                 {1346300, uint256S("0x240136ffd659dde451087e10082075844157ee102b08c469c72f4983421d56be")},
                 {2032461, uint256S("0xd58aac5395970447777021d84469cc060998732480db912167efdd43a0da2139")},
                 {2051160, uint256S("0x56292d0b02685325f6b57c8e96b31033f218eb9bd761f894580b7b91c34c23c1")},
+                {2053000, uint256S("0x1a6bcade2ab7d6d9350631f7fe8e9ba3c050c447389f3370bbef69346901ad69")},
+                {2055000, uint256S("0x6e1317a14c360e184284e91f202300859386864d6e630bbad363dbb3ab159f37")},
+                {2057000, uint256S("0xc49ecbd3f18c1570aacde8e38fccbb27ebb32c2f10dec0766562b936604071aa")},
             }
         };
 
@@ -203,12 +207,10 @@ public:
          // TODO to be specified in a future patch.
         };
 
-        // Photon chain tx data, lifted from Photon-0.15.21
-        // chainparams.cpp:190-194.
         chainTxData = ChainTxData{
-            .nTime    = 1774979502,
-            .nTxCount = 3539700,
-            .dTxRate  = 0.005532614309739894,
+            .nTime    = 1779179072,
+            .nTxCount = 3563534,
+            .dTxRate  = 0.005678206870959294,
         };
     }
 };
