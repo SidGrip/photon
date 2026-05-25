@@ -5632,6 +5632,9 @@ SnapshotCompletionResult ChainstateManager::MaybeCompleteSnapshotValidation(
 
     m_ibd_chainstate->m_disabled = true;
     this->MaybeRebalanceCaches();
+    if (snapshot_validation_completed) {
+        snapshot_validation_completed();
+    }
 
     return SnapshotCompletionResult::SUCCESS;
 }
