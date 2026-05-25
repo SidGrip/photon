@@ -2740,12 +2740,12 @@ if [[ "$BLAKE_TARGET" == "qt" || "$BLAKE_TARGET" == "both" ]]; then
 
     echo ">>> Creating app bundle..."
     make deploydir
-    if [[ -d dist/Bitcoin-Qt.app ]]; then
+    if [[ -d dist/Photon-Qt.app ]]; then
+        rm -rf Photon-Qt.app
+        cp -a dist/Photon-Qt.app Photon-Qt.app
+    elif [[ -d dist/Bitcoin-Qt.app ]]; then
         rm -rf Bitcoin-Qt.app
         cp -a dist/Bitcoin-Qt.app Bitcoin-Qt.app
-    fi
-
-    if [[ -d Bitcoin-Qt.app ]]; then
         rm -rf Photon-Qt.app
         mv Bitcoin-Qt.app Photon-Qt.app
         if [[ -f Photon-Qt.app/Contents/MacOS/Bitcoin-Qt ]]; then

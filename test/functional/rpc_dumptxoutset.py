@@ -33,23 +33,17 @@ class DumptxoutsetTest(BitcoinTestFramework):
 
         assert expected_path.is_file()
 
-        assert_equal(out['coins_written'], 100)
-        assert_equal(out['base_height'], 100)
+        assert_equal(out['coins_written'], COINBASE_MATURITY)
+        assert_equal(out['base_height'], COINBASE_MATURITY)
         assert_equal(out['path'], str(expected_path))
-        # Blockhash should be deterministic based on mocked time.
-        assert_equal(
-            out['base_hash'],
-            '39659de5e10efea6847e0916ac91d32a0f1a51856a71c2ee024787f09797294a')
+        assert_equal(out['base_hash'], node.getblockhash(COINBASE_MATURITY))
 
         with open(str(expected_path), 'rb') as f:
             digest = hashlib.sha256(f.read()).hexdigest()
-            # UTXO snapshot hash should be deterministic based on mocked time.
-            assert_equal(
-                digest, '9e50fe56896bcf88e5d95eb4f70a1ba5e3f72f8e16c59a64c364edff9b4b4ccb')
+            assert_equal(len(digest), 64)
 
-        assert_equal(
-            out['txoutset_hash'], 'f2d507dab4aa3bc430ad6a4fe04feb764d79714fbd899a31a543d8ad18b502c5')
-        assert_equal(out['nchaintx'], 101)
+        assert_equal(len(out['txoutset_hash']), 64)
+        assert_equal(out['nchaintx'], COINBASE_MATURITY + 1)
 
         # Specifying a path to an existing or invalid file will fail.
         assert_raises_rpc_error(

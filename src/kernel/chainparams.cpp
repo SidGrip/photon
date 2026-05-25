@@ -147,8 +147,8 @@ public:
         pchMessageStart[3] = 0xd2;
         nDefaultPort = 35556;
         nPruneAfterHeight = 100000;
-        m_assumed_blockchain_size = 0;
-        m_assumed_chain_state_size = 0;
+        m_assumed_blockchain_size = 6;
+        m_assumed_chain_state_size = 1;
 
         genesis = CreatePhotonGenesisBlock(1392688072, 5992999, 503382015, 112, 32768 * COIN);
         consensus.hashGenesisBlock = genesis.GetHash();
@@ -204,7 +204,13 @@ public:
         };
 
         m_assumeutxo_data = MapAssumeutxo{
-         // TODO to be specified in a future patch.
+            {
+                2057519,
+                {
+                    AssumeutxoHash{uint256S("0xb76486b1888d365bedb9ed3009fcb1da7184c196e54fe71bd4a74a13030a61a6")},
+                    3566180,
+                },
+            },
         };
 
         chainTxData = ChainTxData{
