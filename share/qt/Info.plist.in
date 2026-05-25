@@ -34,7 +34,7 @@
   <string>????</string>
 
   <key>CFBundleExecutable</key>
-  <string>photon-qt</string>
+  <string>Photon-Qt</string>
 
   <key>CFBundleName</key>
   <string>Photon-Qt</string>
@@ -43,7 +43,7 @@
   <true/>
 
   <key>CFBundleIdentifier</key>
-  <string>org.blakestream.Photon-Qt</string>
+  <string>org.photon.Photon-Qt</string>
 
   <key>CFBundleURLTypes</key>
   <array>
@@ -51,7 +51,7 @@
       <key>CFBundleTypeRole</key>
       <string>Editor</string>
       <key>CFBundleURLName</key>
-      <string>org.blakestream.PhotonPayment</string>
+      <string>org.photon.PhotonPayment</string>
       <key>CFBundleURLSchemes</key>
       <array>
         <string>photon</string>
