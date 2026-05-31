@@ -11,21 +11,11 @@
 #include <limits>
 
 namespace {
-CAmount ScaleFeeRatePerK(const CAmount& nFeePaid, int64_t num_bytes)
+CAmount ClampFeeRate(__int128 value)
 {
-    const CAmount quotient{nFeePaid / num_bytes};
-    const CAmount remainder{nFeePaid % num_bytes};
-    const CAmount limit_max{std::numeric_limits<CAmount>::max()};
-    const CAmount limit_min{std::numeric_limits<CAmount>::min()};
-
-    if (quotient > limit_max / 1000) return limit_max;
-    if (quotient < limit_min / 1000) return limit_min;
-
-    const CAmount base{quotient * 1000};
-    const CAmount tail{(remainder * 1000) / num_bytes};
-    if (tail > 0 && base > limit_max - tail) return limit_max;
-    if (tail < 0 && base < limit_min - tail) return limit_min;
-    return base + tail;
+    if (value > std::numeric_limits<CAmount>::max()) return std::numeric_limits<CAmount>::max();
+    if (value < std::numeric_limits<CAmount>::min()) return std::numeric_limits<CAmount>::min();
+    return static_cast<CAmount>(value);
 }
 } // namespace
 
@@ -34,7 +24,7 @@ CFeeRate::CFeeRate(const CAmount& nFeePaid, uint32_t num_bytes)
     const int64_t nSize{num_bytes};
 
     if (nSize > 0) {
-        nSatoshisPerK = ScaleFeeRatePerK(nFeePaid, nSize);
+        nSatoshisPerK = ClampFeeRate(static_cast<__int128>(nFeePaid) * 1000 / nSize);
     } else {
         nSatoshisPerK = 0;
     }

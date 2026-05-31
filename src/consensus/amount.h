@@ -16,13 +16,19 @@ static constexpr CAmount COIN = 100000000;
 
 /** No amount larger than this (in satoshi) is valid.
  *
- * Note that this constant is Photon's legacy money-range sanity check, not a
- * total-supply schedule. As this sanity check is used by consensus-critical
- * validation code, the exact value of the MAX_MONEY constant is consensus
- * critical; in unusual circumstances like a(nother) overflow bug that allowed
- * for the creation of coins out of thin air modification could lead to a fork.
+ * Photon's money-range sanity ceiling (per-output and per-transaction-sum),
+ * consensus-critical. Held at 10,000,000,000 coins, which is below INT64_MAX/2
+ * so the wallet's change-target math (payment_value * 2 in GenerateChangeTarget)
+ * cannot overflow.
+ *
+ * CONSENSUS CAVEAT: this value must match the live network's cap and must be
+ * >= every confirmed on-chain single output and per-transaction output-sum, or
+ * nodes will reject those blocks ("bad-txns-vout-toolarge" /
+ * "bad-txns-txouttotal-toolarge") and fork. Lowering it relative to the live
+ * 0.15.21 network (90,000,000,000) is only safe as a coordinated upgrade after
+ * verifying the largest confirmed output/tx-sum on-chain. See repos/maxmoney-qc.md.
  * */
-static constexpr CAmount MAX_MONEY = 90000000000LL * COIN;
+static constexpr CAmount MAX_MONEY = 10000000000LL * COIN;
 inline bool MoneyRange(const CAmount& nValue) { return (nValue >= 0 && nValue <= MAX_MONEY); }
 
 #endif // BITCOIN_CONSENSUS_AMOUNT_H
