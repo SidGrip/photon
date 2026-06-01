@@ -140,6 +140,29 @@ the test does not touch an existing 0.15.21 wallet or chainstate:
 photon-qt -datadir=/path/to/photon-25.2-test
 ```
 
+## Sending Large Amounts
+
+Photon 0.25.2 enforces a consensus money-range cap of **10,000,000,000 PHO**
+(`MAX_MONEY`), applied per output and per transaction, so a single transaction
+cannot move more than 10,000,000,000 PHO to one address.
+
+To pay one address more than the cap, use the included helper, which splits the
+payment into several transactions (each well under the cap) via the wallet's
+`sendtoaddress`:
+
+```bash
+python3 contrib/send-big-pho.py <address> <total_PHO_amount>
+# e.g. 25 billion PHO, sent as three transactions:
+python3 contrib/send-big-pho.py PhotonAddressHere 25000000000
+```
+
+Options: `--chunk` (max PHO per transaction, default `9000000000`), `--datadir`,
+`--delay` (seconds between transactions), and `--yes` (skip the confirmation
+prompt, for non-interactive use). The helper validates the address, checks the
+balance, prints each txid, and logs progress so an interrupted run resumes
+without re-sending. Requires `python3` and `pip install requests`, run on the
+same host as `photond`.
+
 ## Build Options
 
 ```bash
