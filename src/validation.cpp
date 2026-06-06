@@ -1541,6 +1541,14 @@ PackageMempoolAcceptResult ProcessNewPackage(Chainstate& active_chainstate, CTxM
     return result;
 }
 
+// CONSENSUS-CRITICAL floating point. The block subsidy is 32768 PHO plus a
+// sqrt(difficulty * height) bonus measured in satoshis, inherited from the live
+// 0.15.21 chain. Every step is a correctly-rounded IEEE-754 operation (mantissa
+// division, exact *256 power-of-two scaling, and std::sqrt), so the value is
+// identical across IEEE-754 platforms and the live network depends on that. Do
+// NOT rewrite this to integer math (it changes historical results and forks the
+// chain), and do NOT build with -ffast-math / -funsafe-math-optimizations /
+// -ffp-contract=fast or x87 80-bit math, which would break determinism.
 CAmount GetBlockSubsidy(int nHeight, unsigned int nBits, const Consensus::Params& consensusParams)
 {
     if (nHeight == 0) {
@@ -2195,6 +2203,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                                           pindex->nHeight < params.GetConsensus().BIP34Height;
     bool fEnforceBIP30 = !legacy_mainnet_pre_bip34 && !IsBIP30Repeat(*pindex);
 
+    // NOTE (Photon): the comment block below is inherited verbatim from Bitcoin
+    // Core and describes *Bitcoin's* history — the "BIP34 height of 227,931" and
+    // the out-of-sequence indicated heights (209,921 / 490,897 / 1,983,702) are
+    // Bitcoin's, not Photon's. Photon's actual rule is set above: BIP30 is disabled
+    // on mainnet below BIP34Height (2072227) via legacy_mainnet_pre_bip34 and
+    // enforced strictly at/after it. The IsBIP30Repeat/IsBIP30Unspendable lists are
+    // Photon-specific legacy 0.15.21 duplicate coinbases. The inherited text is kept
+    // for provenance; do not act on its Bitcoin-specific heights.
+    //
+    // [Bitcoin Core, for reference]
     // Once BIP34 activated it was not possible to create new duplicate coinbases and thus other than starting
     // with the 2 existing duplicate coinbase pairs, not possible to create overwriting txs.  But by the
     // time BIP34 activated, in each of the existing pairs the duplicate coinbase had overwritten the first
@@ -3796,10 +3814,16 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new", "block timestamp too far in the future");
     }
 
-    // Reject blocks with outdated version
-    if ((block.nVersion < 2 && DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_HEIGHTINCB)) ||
-        (block.nVersion < 3 && DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_DERSIG)) ||
-        (block.nVersion < 4 && DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_CLTV))) {
+    // Reject blocks with outdated version. Gate on the BASE version: this is an
+    // AuxPoW chain, so the chain-id (and auxpow flag) live in the high bits of
+    // nVersion and would otherwise inflate it above the 2/3/4 thresholds, making
+    // the check a no-op. GetBaseVersion() reads the version with those high bits
+    // masked off (the header's nVersion is unchanged), so the comparison sees the
+    // real base version (Namecoin/AuxPoW convention). Diagnostics below still
+    // print the raw on-the-wire nVersion.
+    if ((block.GetBaseVersion() < 2 && DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_HEIGHTINCB)) ||
+        (block.GetBaseVersion() < 3 && DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_DERSIG)) ||
+        (block.GetBaseVersion() < 4 && DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_CLTV))) {
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, strprintf("bad-version(0x%08x)", block.nVersion),
                                  strprintf("rejected nVersion=0x%08x block", block.nVersion));
     }
